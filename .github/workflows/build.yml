@@ -18,14 +18,29 @@ jobs:
         with:
           channel: 'stable'
       
-      # 自动补全原生安卓脚手架
       - name: Scaffold Project
         run: flutter create --platforms=android .
 
-      # 注入网络与存储权限到 AndroidManifest.xml
       - name: Add Android Permissions
         run: |
           sed -i '/<application/i \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>' android/app/src/main/AndroidManifest.xml
+
+      # 将 compileSdk 强制提升到 36，并统一所有第三方依赖库的 compileSdk
+      - name: Patch compileSdk Version
+        run: |
+          sed -i 's/compileSdk = .*/compileSdk = 36/' android/app/build.gradle
+          cat << 'EOF' >> android/app/build.gradle
+
+          subprojects {
+              afterEvaluate { project ->
+                  if (project.hasProperty("android")) {
+                      android {
+                          compileSdkVersion 36
+                      }
+                  }
+              }
+          }
+          EOF
 
       - name: Install dependencies
         run: flutter pub get
@@ -47,7 +62,6 @@ jobs:
         with:
           channel: 'stable'
 
-      # 自动补全原生 Windows 脚手架
       - name: Scaffold Project
         run: flutter create --platforms=windows .
 
