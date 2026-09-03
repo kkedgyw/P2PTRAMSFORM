@@ -1,0 +1,26 @@
+name: p2p_file_transfer
+description: "A P2P file transfer app"
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  shelf: ^1.4.1
+  shelf_router: ^1.1.4
+  http: ^1.2.0
+  file_picker: ^8.0.0
+  path_provider: ^2.1.2
+  network_info_plus: ^5.0.1
+  permission_handler: ^11.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
