@@ -16,6 +16,7 @@ jobs:
           java-version: '17'
       - uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.24.5'
           channel: 'stable'
       
       - name: Scaffold Project
@@ -24,29 +25,6 @@ jobs:
       - name: Add Android Permissions
         run: |
           sed -i '/<application/i \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>' android/app/src/main/AndroidManifest.xml
-
-      # 全局关闭 AAR Metadata 阻断检查，并覆盖 compileSdk
-      - name: Bypass AAR Metadata Check & Patch SDK
-        run: |
-          # 1. 在 gradle.properties 中直接关闭 AAR Metadata 错误阻断
-          echo "android.suppressUnsupportedCompileSdk=36" >> android/gradle.properties
-          
-          # 2. 修改 app 层 build.gradle.kts
-          if [ -f "android/app/build.gradle.kts" ]; then
-            sed -i 's/compileSdk = .*/compileSdk = 36/' android/app/build.gradle.kts
-          fi
-
-          # 3. 强制在每个子插件评估时，关闭 checkAarMetadata 检查任务并提升 SDK
-          cat << 'EOF' >> android/settings.gradle.kts
-
-          gradle.beforeProject {
-              project.tasks.configureEach {
-                  if (name.contains("checkAarMetadata", ignoreCase = true)) {
-                      enabled = false
-                  }
-              }
-          }
-          EOF
 
       - name: Install dependencies
         run: flutter pub get
@@ -66,6 +44,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.24.5'
           channel: 'stable'
 
       - name: Scaffold Project
