@@ -47,8 +47,18 @@ jobs:
           flutter-version: '3.24.5'
           channel: 'stable'
 
-      - name: Scaffold Project
-        run: flutter create --project-name p2p_transfer --platforms=windows .
+      - name: Enable Windows Desktop & Scaffold
+        run: |
+          flutter config --enable-windows-desktop
+          flutter create --project-name p2p_transfer --platforms=windows .
+
+      # 适配 GitHub Actions 环境中的 Visual Studio 2022
+      - name: Configure CMake for Visual Studio 2022
+        run: |
+          $cmakeFile = "windows/CMakeLists.txt"
+          if (Test-Path $cmakeFile) {
+            (Get-Content $cmakeFile) -replace 'Visual Studio 16 2019', 'Visual Studio 17 2022' | Set-Content $cmakeFile
+          }
 
       - name: Install dependencies
         run: flutter pub get
