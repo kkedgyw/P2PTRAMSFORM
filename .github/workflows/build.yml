@@ -39,14 +39,10 @@ jobs:
           path: build/app/outputs/flutter-apk/app-release.apk
 
   build-windows:
-    runs-on: windows-latest
+    # 锁定标准的 windows-2022 镜像环境
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-
-      # 激活 Windows 虚拟机的 Visual Studio 2022 开发环境与 MSBuild/CMake 工具链
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          vsversion: '2022'
 
       - uses: subosito/flutter-action@v2
         with:
@@ -61,8 +57,12 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
+      # 使用 cmd 调用 VS 2022 官方环境变量入口执行编译
       - name: Build Windows Executable
-        run: flutter build windows --release
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          flutter build windows --release
 
       - name: Upload Windows
         uses: actions/upload-artifact@v4
