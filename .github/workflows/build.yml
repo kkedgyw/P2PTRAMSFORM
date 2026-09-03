@@ -25,35 +25,22 @@ jobs:
         run: |
           sed -i '/<application/i \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>' android/app/src/main/AndroidManifest.xml
 
-      # 兼容适配 .gradle 或 .gradle.kts，强制将 compileSdk/compileSdkVersion 设为 36
-      - name: Patch compileSdk Version
+      # 统一将 compileSdk 设为 36，并配置覆盖第三方插件的 compileSdkVersion
+      - name: Patch Android SDK Configuration
         run: |
+          # 1. 替换主 app 的 compileSdk
           if [ -f "android/app/build.gradle.kts" ]; then
             sed -i 's/compileSdk = .*/compileSdk = 36/' android/app/build.gradle.kts
-            sed -i 's/compileSdkVersion(.*/compileSdkVersion(36)/' android/app/build.gradle.kts
+          fi
+
+          # 2. 在根目录 build.gradle.kts 中配置统一覆盖（不使用 afterEvaluate）
+          if [ -f "android/build.gradle.kts" ]; then
             cat << 'EOF' >> android/build.gradle.kts
 
           subprojects {
-              afterEvaluate {
-                  if (project.hasProperty("android")) {
-                      val android = project.extensions.findByName("android") as? com.android.build.gradle.BaseExtension
-                      android?.compileSdkVersion(36)
-                  }
-              }
-          }
-          EOF
-          elif [ -f "android/app/build.gradle" ]; then
-            sed -i 's/compileSdk = .*/compileSdk = 36/' android/app/build.gradle
-            sed -i 's/compileSdkVersion .*/compileSdkVersion 36/' android/app/build.gradle
-            cat << 'EOF' >> android/build.gradle
-
-          subprojects {
-              afterEvaluate { project ->
-                  if (project.hasProperty("android")) {
-                      android {
-                          compileSdkVersion 36
-                      }
-                  }
+              project.plugins.withId("com.android.library") {
+                  val android = project.extensions.findByType(com.android.build.gradle.BaseExtension::class.java)
+                  android?.compileSdkVersion(36)
               }
           }
           EOF
