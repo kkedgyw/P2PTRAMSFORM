@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart' hide Router;
 import 'package:file_picker/file_picker.dart';
-import 'package:network_info_plus/network_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shelf/shelf.dart';
@@ -40,7 +39,7 @@ class P2PTransferScreen extends StatefulWidget {
 }
 
 class _P2PTransferScreenState extends State<P2PTransferScreen> {
-  String _localIp = '正在获取...';
+  List<String> _localIps = [];
   String _deviceName = '未知设备';
   HttpServer? _server;
   RawDatagramSocket? _udpSocket;
@@ -72,17 +71,39 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
       _deviceName = 'Device-${Platform.operatingSystem}';
     }
 
-    final info = NetworkInfo();
-    final ip = await info.getWifiIP();
-    setState(() {
-      _localIp = ip ?? '未连接 WiFi 或无法识别';
-    });
-
+    await _refreshLocalIps();
     await _startReceiverServer();
     await _startUdpDiscovery();
   }
 
-  // 1. 启动 HTTP 文件流式接收服务
+  // 获取本机所有有效的 IPv4 地址（支持以太网/Wi-Fi）
+  Future<void> _refreshLocalIps() async {
+    List<String> ips = [];
+    try {
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLinkLocal: false,
+      );
+      for (var interface in interfaces) {
+        // 过滤虚拟机/虚拟网卡（如 WSL, Docker, VMware）
+        final name = interface.name.toLowerCase();
+        if (name.contains('vethernet') || name.contains('vmware') || name.contains('vbox') || name.contains('docker')) {
+          continue;
+        }
+        for (var addr in interface.addresses) {
+          if (!addr.isLoopback) {
+            ips.add(addr.address);
+          }
+        }
+      }
+    } catch (_) {}
+
+    setState(() {
+      _localIps = ips;
+    });
+  }
+
+  // 1. 启动 HTTP 接收服务（监听 0.0.0.0 涵盖所有网卡）
   Future<void> _startReceiverServer() async {
     final router = shelf_route.Router();
     final dir = Platform.isAndroid
@@ -117,7 +138,7 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
     _server = await shelf_io.serve(router.call, InternetAddress.anyIPv4, _httpPort);
   }
 
-  // 2. 启动 UDP 广播与近场设备扫描
+  // 2. 启动 UDP 广播（支持有线/无线双向发现）
   Future<void> _startUdpDiscovery() async {
     try {
       _udpSocket = await RawDatagramSocket.bind(
@@ -128,7 +149,6 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
       );
       _udpSocket?.broadcastEnabled = true;
 
-      // 监听广播包
       _udpSocket?.listen((event) {
         if (event == RawSocketEvent.read) {
           final datagram = _udpSocket?.receive();
@@ -142,8 +162,8 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
               final remoteOs = parts[2];
               final remoteIp = datagram.address.address;
 
-              // 过滤掉自己发出的广播包
-              if (remoteIp != _localIp && remoteIp != '127.0.0.1') {
+              // 排除本机的所有网卡 IP
+              if (!_localIps.contains(remoteIp) && remoteIp != '127.0.0.1') {
                 setState(() {
                   _devices[remoteIp] = DiscoveredDevice(
                     ip: remoteIp,
@@ -158,9 +178,8 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
         }
       });
 
-      // 每 2 秒向广播地址发送自身心跳包
       _broadcastTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
-        if (_udpSocket == null || _localIp.contains('无法识别')) return;
+        if (_udpSocket == null || _localIps.isEmpty) return;
         final packet = 'P2P_DISCOVER|$_deviceName|${Platform.operatingSystem}';
         final data = utf8.encode(packet);
         _udpSocket?.send(
@@ -170,7 +189,6 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
         );
       });
 
-      // 每 3 秒清理超过 6 秒未收到心跳的离线设备
       _cleanupTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
         final now = DateTime.now();
         setState(() {
@@ -179,11 +197,10 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
         });
       });
     } catch (e) {
-      setState(() => _status = 'UDP 广播初始化失败: $e');
+      setState(() => _status = 'UDP 初始化异常: $e');
     }
   }
 
-  // 3. 向选中的设备发送文件
   Future<void> _sendFileToDevice(DiscoveredDevice target) async {
     final result = await FilePicker.platform.pickFiles();
     if (result == null || result.files.isEmpty) return;
@@ -196,7 +213,7 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
     final uri = Uri.parse('http://${target.ip}:$_httpPort/upload?filename=$fileName');
 
     setState(() {
-      _status = '正在向 ${target.name} (${target.ip}) 发送文件...';
+      _status = '正在发送至 ${target.name}...';
       _progress = 0.0;
     });
 
@@ -221,12 +238,12 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
 
       final res = await req.send();
       if (res.statusCode == 200) {
-        setState(() => _status = '成功发送到 ${target.name}！');
+        setState(() => _status = '发送成功！');
       } else {
-        setState(() => _status = '发送失败，远端返回: ${res.statusCode}');
+        setState(() => _status = '发送失败: ${res.statusCode}');
       }
     } catch (e) {
-      setState(() => _status = '发送出错: $e');
+      setState(() => _status = '发送异常: $e');
     }
   }
 
@@ -249,15 +266,19 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
   @override
   Widget build(BuildContext context) {
     final deviceList = _devices.values.toList();
+    final ipDisplay = _localIps.isEmpty ? '未获取到有效 IP' : _localIps.join(' / ');
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('局域网免密极速快传'),
+        title: const Text('局域网极速互传'),
         actions: [
           IconButton(
             icon: const Icon(Icons.refresh),
-            onPressed: () => setState(() => _devices.clear()),
-            tooltip: '刷新设备',
+            onPressed: () {
+              _refreshLocalIps();
+              setState(() => _devices.clear());
+            },
+            tooltip: '重新扫描',
           ),
         ],
       ),
@@ -275,13 +296,13 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
                     Icon(_getDeviceIcon(Platform.operatingSystem), size: 28),
                     const SizedBox(width: 8),
                     Text(
-                      '本机名称: $_deviceName',
+                      _deviceName,
                       style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
                     ),
                   ],
                 ),
-                const SizedBox(height: 4),
-                Text('本机 IP: $_localIp', style: const TextStyle(color: Colors.grey)),
+                const SizedBox(height: 6),
+                Text('本机 IP: $ipDisplay', style: const TextStyle(color: Colors.grey, fontSize: 13)),
               ],
             ),
           ),
@@ -291,14 +312,9 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             child: Row(
               children: [
-                const SizedBox(
-                  width: 12,
-                  height: 12,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
+                const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2)),
                 const SizedBox(width: 8),
-                Text('附近的在线设备 (${deviceList.length})',
-                    style: const TextStyle(fontWeight: FontWeight.bold)),
+                Text('在线设备 (${deviceList.length})', style: const TextStyle(fontWeight: FontWeight.bold)),
               ],
             ),
           ),
@@ -306,7 +322,7 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
             child: deviceList.isEmpty
                 ? const Center(
                     child: Text(
-                      '正在持续雷达扫描中...\n请确保对方设备已打开且连接同一 Wi-Fi',
+                      '正在持续搜索局域网设备...\n请确保两台设备在同一子网，且 Windows 防火墙已允许该程序',
                       textAlign: TextAlign.center,
                       style: TextStyle(color: Colors.grey),
                     ),
@@ -318,11 +334,8 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
                       return Card(
                         margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
                         child: ListTile(
-                          leading: CircleAvatar(
-                            child: Icon(_getDeviceIcon(target.os)),
-                          ),
-                          title: Text(target.name,
-                              style: const TextStyle(fontWeight: FontWeight.bold)),
+                          leading: CircleAvatar(child: Icon(_getDeviceIcon(target.os))),
+                          title: Text(target.name, style: const TextStyle(fontWeight: FontWeight.bold)),
                           subtitle: Text('${target.os.toUpperCase()} • ${target.ip}'),
                           trailing: ElevatedButton.icon(
                             onPressed: () => _sendFileToDevice(target),
