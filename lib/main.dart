@@ -1,12 +1,12 @@
 import 'dart:io';
-import 'package:flutter/material.dart';
+import 'package:flutter/material.dart' hide Router;
 import 'package:file_picker/file_picker.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
-import 'package:shelf_router/shelf_router.dart';
+import 'package:shelf_router/shelf_router.dart' as shelf_route;
 import 'package:http/http.dart' as http;
 
 void main() {
@@ -51,7 +51,7 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
   }
 
   Future<void> _startReceiverServer() async {
-    final router = Router();
+    final router = shelf_route.Router();
     final dir = Platform.isAndroid 
         ? await getExternalStorageDirectory() 
         : await getApplicationDocumentsDirectory();
