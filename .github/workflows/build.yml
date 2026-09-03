@@ -42,6 +42,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      # 激活 Windows 虚拟机的 Visual Studio 2022 开发环境与 MSBuild/CMake 工具链
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          vsversion: '2022'
+
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.24.5'
@@ -51,14 +57,6 @@ jobs:
         run: |
           flutter config --enable-windows-desktop
           flutter create --project-name p2p_transfer --platforms=windows .
-
-      # 适配 GitHub Actions 环境中的 Visual Studio 2022
-      - name: Configure CMake for Visual Studio 2022
-        run: |
-          $cmakeFile = "windows/CMakeLists.txt"
-          if (Test-Path $cmakeFile) {
-            (Get-Content $cmakeFile) -replace 'Visual Studio 16 2019', 'Visual Studio 17 2022' | Set-Content $cmakeFile
-          }
 
       - name: Install dependencies
         run: flutter pub get
