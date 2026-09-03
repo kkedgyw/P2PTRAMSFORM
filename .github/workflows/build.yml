@@ -25,11 +25,27 @@ jobs:
         run: |
           sed -i '/<application/i \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>' android/app/src/main/AndroidManifest.xml
 
-      # 将 compileSdk 强制提升到 36，并统一所有第三方依赖库的 compileSdk
+      # 兼容适配 .gradle 或 .gradle.kts，强制将 compileSdk/compileSdkVersion 设为 36
       - name: Patch compileSdk Version
         run: |
-          sed -i 's/compileSdk = .*/compileSdk = 36/' android/app/build.gradle
-          cat << 'EOF' >> android/app/build.gradle
+          if [ -f "android/app/build.gradle.kts" ]; then
+            sed -i 's/compileSdk = .*/compileSdk = 36/' android/app/build.gradle.kts
+            sed -i 's/compileSdkVersion(.*/compileSdkVersion(36)/' android/app/build.gradle.kts
+            cat << 'EOF' >> android/build.gradle.kts
+
+          subprojects {
+              afterEvaluate {
+                  if (project.hasProperty("android")) {
+                      val android = project.extensions.findByName("android") as? com.android.build.gradle.BaseExtension
+                      android?.compileSdkVersion(36)
+                  }
+              }
+          }
+          EOF
+          elif [ -f "android/app/build.gradle" ]; then
+            sed -i 's/compileSdk = .*/compileSdk = 36/' android/app/build.gradle
+            sed -i 's/compileSdkVersion .*/compileSdkVersion 36/' android/app/build.gradle
+            cat << 'EOF' >> android/build.gradle
 
           subprojects {
               afterEvaluate { project ->
@@ -41,6 +57,7 @@ jobs:
               }
           }
           EOF
+          fi
 
       - name: Install dependencies
         run: flutter pub get
