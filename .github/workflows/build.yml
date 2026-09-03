@@ -20,7 +20,7 @@ jobs:
           channel: 'stable'
       
       - name: Scaffold Project
-        run: flutter create --platforms=android .
+        run: flutter create --project-name p2p_transfer --platforms=android .
 
       - name: Add Android Permissions
         run: |
@@ -48,7 +48,7 @@ jobs:
           channel: 'stable'
 
       - name: Scaffold Project
-        run: flutter create --platforms=windows .
+        run: flutter create --project-name p2p_transfer --platforms=windows .
 
       - name: Install dependencies
         run: flutter pub get
