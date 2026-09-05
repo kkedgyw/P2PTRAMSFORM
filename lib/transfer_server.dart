@@ -21,7 +21,8 @@ typedef ConfirmRequest = void Function(
 ///   POST /transfer/upload   逐文件上传，文件名/序号在 query
 ///   POST /transfer/cancel   任一方取消
 class TransferServer {
-  final String saveDir;
+  /// 保存目录。授权状态可能中途变化（用户去设置页开了权限），故不做 final
+  String saveDir;
   final ConfirmRequest onConfirmRequest;
   final void Function(TransferSession session) onSessionChanged;
 

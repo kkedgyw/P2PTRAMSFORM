@@ -4,6 +4,7 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
@@ -49,6 +50,8 @@ class _HomeScreenState extends State<HomeScreen> {
   String _deviceName = '未知设备';
   String _status = '就绪';
   String? _saveDir;
+  bool _publicStorage = false;
+  String? _storageNote;
   bool _initializing = true;
 
   DeviceDiscovery? _discovery;
@@ -91,7 +94,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
     _deviceName = _resolveDeviceName();
     _localIps = await refreshLocalIps();
-    _saveDir = await resolveSaveDir();
+
+    final location = await resolveSaveLocation();
+    _saveDir = location.path;
+    _publicStorage = location.isPublic;
+    _storageNote = location.note;
 
     _server = TransferServer(
       saveDir: _saveDir!,
@@ -341,15 +348,71 @@ class _HomeScreenState extends State<HomeScreen> {
           const SizedBox(height: 6),
           Text('本机 IP: $ipDisplay',
               style: const TextStyle(color: Colors.grey, fontSize: 13)),
-          if (_saveDir != null)
+          if (_saveDir != null) _buildSaveDirInfo(),
+        ],
+      ),
+    );
+  }
+
+  /// 保存位置 + 权限提示。拿不到公共目录时给出明确原因和去授权的入口
+  Widget _buildSaveDirInfo() {
+    final dir = _saveDir;
+    if (dir == null) return const SizedBox.shrink();
+    final warning = !_publicStorage && Platform.isAndroid;
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(warning ? Icons.folder_off : Icons.folder_open,
+                  size: 14, color: warning ? Colors.orange : Colors.grey),
+              const SizedBox(width: 4),
+              Expanded(
+                child: Text('接收保存到: $dir',
+                    style: const TextStyle(color: Colors.grey, fontSize: 12)),
+              ),
+            ],
+          ),
+          if (_storageNote != null)
             Padding(
-              padding: const EdgeInsets.only(top: 2),
-              child: Text('接收保存到: $_saveDir',
-                  style: const TextStyle(color: Colors.grey, fontSize: 12)),
+              padding: const EdgeInsets.only(top: 4, left: 18),
+              child: Text(_storageNote!,
+                  style: const TextStyle(color: Colors.orange, fontSize: 11)),
+            ),
+          if (warning)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton(
+                style: TextButton.styleFrom(
+                  padding: EdgeInsets.zero,
+                  minimumSize: const Size(0, 28),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                onPressed: _openStorageSettings,
+                child: const Text('去设置授予「所有文件访问权限」',
+                    style: TextStyle(fontSize: 12)),
+              ),
             ),
         ],
       ),
     );
+  }
+
+  /// 跳系统设置页授权，返回后重新解析保存位置
+  Future<void> _openStorageSettings() async {
+    await openAppSettings();
+    final loc = await resolveSaveLocation();
+    if (!mounted) return;
+    setState(() {
+      _saveDir = loc.path;
+      _publicStorage = loc.isPublic;
+      _storageNote = loc.note;
+    });
+    _server?.saveDir = loc.path;
   }
 
   Widget _buildTransferPanel() {
@@ -437,9 +500,37 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             if (s.savedPaths.isNotEmpty)
               Padding(
-                padding: const EdgeInsets.only(top: 2),
-                child: Text('已保存 ${s.savedPaths.length} 个文件',
-                    style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                padding: const EdgeInsets.only(top: 4),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('已保存 ${s.savedPaths.length} 个文件:',
+                        style:
+                            const TextStyle(fontSize: 11, color: Colors.grey)),
+                    ...s.savedPaths.take(5).map(
+                          (path) => Padding(
+                            padding: const EdgeInsets.only(left: 6, top: 1),
+                            child: Text('· ${p.basename(path)}',
+                                style: const TextStyle(
+                                    fontSize: 11, color: Colors.grey),
+                                overflow: TextOverflow.ellipsis),
+                          ),
+                        ),
+                    if (s.savedPaths.length > 5)
+                      Padding(
+                        padding: const EdgeInsets.only(left: 6, top: 1),
+                        child: Text('· 还有 ${s.savedPaths.length - 5} 个…',
+                            style: const TextStyle(
+                                fontSize: 11, color: Colors.grey)),
+                      ),
+                    Padding(
+                      padding: const EdgeInsets.only(left: 6, top: 2),
+                      child: Text('目录: ${p.dirname(s.savedPaths.first)}',
+                          style: const TextStyle(
+                              fontSize: 11, color: Colors.blueGrey)),
+                    ),
+                  ],
+                ),
               ),
           ],
         ),
