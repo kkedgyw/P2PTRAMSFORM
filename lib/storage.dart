@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -22,12 +23,14 @@ class SaveLocation {
       {this.isPublic = false, this.isCustom = false, this.note});
 }
 
-/// 用户手动指定的保存目录，持久化到应用支持目录下的一个 JSON 文件。
+/// 应用设置持久化（保存目录 / 加密口令等），存在应用支持目录下的一个 JSON 文件。
 ///
 /// 用文件而不是 shared_preferences，是为了不再引入新依赖（桌面端各平台的
 /// 注册表/GSettings 后端行为不一致，反而更容易出问题）。
-class SaveDirPrefs {
-  static const _fileName = 'save_dir.json';
+class AppPrefs {
+  static const _fileName = 'prefs.json';
+  static const _keySaveDir = 'saveDir';
+  static const _keyPassphrase = 'passphrase';
 
   static Future<File> _prefsFile() async {
     final dir = await getApplicationSupportDirectory();
@@ -37,35 +40,48 @@ class SaveDirPrefs {
     return File(p.join(dir.path, _fileName));
   }
 
-  static Future<String?> load() async {
+  static Future<Map<String, dynamic>> _read() async {
     try {
       final file = await _prefsFile();
-      if (!await file.exists()) return null;
+      if (!await file.exists()) return {};
       final raw = await file.readAsString();
-      if (raw.trim().isEmpty) return null;
-      // 手写解析，避免为一行 JSON 引入 dart:convert 之外的东西
-      final m = RegExp('"path"\\s*:\\s*"(.*?)"').firstMatch(raw);
-      final path = m?.group(1);
-      if (path == null || path.isEmpty) return null;
-      // 注意：单个反斜杠不能写成 r'\' —— raw string 里 \' 仍会转义单引号，
-      // 导致字符串无法终止。统一用普通字符串写法。
-      return path.replaceAll('\\"', '"').replaceAll('\\\\', '\\');
-    } catch (_) {
-      return null;
-    }
-  }
-
-  static Future<void> save(String path) async {
-    final escaped = path.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
-    await (await _prefsFile()).writeAsString('{"path": "$escaped"}');
-  }
-
-  static Future<void> clear() async {
-    try {
-      final file = await _prefsFile();
-      if (await file.exists()) await file.delete();
+      if (raw.trim().isEmpty) return {};
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) return Map<String, dynamic>.from(decoded);
     } catch (_) {}
+    return {};
   }
+
+  static Future<void> _write(Map<String, dynamic> data) async {
+    await (await _prefsFile()).writeAsString(jsonEncode(data));
+  }
+
+  static Future<String?> _get(String key) async {
+    final value = (await _read())[key];
+    return value?.toString();
+  }
+
+  static Future<void> _set(String key, String? value) async {
+    final data = await _read();
+    if (value == null || value.isEmpty) {
+      data.remove(key);
+    } else {
+      data[key] = value;
+    }
+    await _write(data);
+  }
+
+  static Future<String?> loadSaveDir() => _get(_keySaveDir);
+
+  static Future<void> saveSaveDir(String path) => _set(_keySaveDir, path);
+
+  static Future<void> clearSaveDir() => _set(_keySaveDir, null);
+
+  /// 端到端加密口令。为空表示不加密
+  static Future<String?> loadPassphrase() => _get(_keyPassphrase);
+
+  static Future<void> savePassphrase(String? value) =>
+      _set(_keyPassphrase, value);
 }
 
 /// 让用户选择接收目录。
@@ -90,7 +106,7 @@ Future<String?> pickSaveDirectory({String? initialDirectory}) async {
 /// 优先级：用户手动指定的目录（仍可写时）> 平台默认目录。
 /// 自定义目录失效（被删 / 权限丢失）时不静默丢弃，而是回退并给出可读原因。
 Future<SaveLocation> resolveSaveLocation() async {
-  final custom = await SaveDirPrefs.load();
+  final custom = await AppPrefs.loadSaveDir();
   if (custom != null && custom.isNotEmpty) {
     final dir = Directory(custom);
     try {

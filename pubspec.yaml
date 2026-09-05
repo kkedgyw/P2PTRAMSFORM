@@ -18,6 +18,9 @@ dependencies:
   network_info_plus: ^5.0.1
   permission_handler: ^11.3.1
   path: ^1.9.0
+  # 端到端加密（AES-GCM + PBKDF2）。要求 Dart >=3.3.0，CI 的 Dart 3.5 满足。
+  # 不引入 cryptography_flutter：它会带来原生依赖，而本机无法验证其 Gradle 兼容性
+  cryptography: ^2.9.0
   # 注意：不要升到 10.x/11.x —— 那两代要求 Flutter >=3.38/3.44，
   # 而本仓库 CI 锁定 Flutter 3.24.5，升上去 pub get 会直接解析失败。
   flutter_foreground_task: ^9.2.2

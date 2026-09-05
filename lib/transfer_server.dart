@@ -6,6 +6,7 @@ import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart' as shelf_route;
 
+import 'crypto.dart';
 import 'models.dart';
 import 'storage.dart';
 
@@ -27,6 +28,10 @@ class TransferServer {
   /// 本设备名称，/ping 与传输请求里带回给对端
   String deviceName;
 
+  /// 端到端加密口令。为空表示本机未启用加密。
+  /// 可中途变更（用户在设置里改），故不做 final
+  String? passphrase;
+
   final ConfirmRequest onConfirmRequest;
   final void Function(TransferSession session) onSessionChanged;
 
@@ -42,6 +47,7 @@ class TransferServer {
     required this.deviceName,
     required this.onConfirmRequest,
     required this.onSessionChanged,
+    this.passphrase,
   });
 
   Future<void> start() async {
@@ -96,11 +102,44 @@ class TransferServer {
       final transferId = json['transferId']?.toString() ?? '';
       final senderName = json['senderName']?.toString() ?? '未知设备';
 
+      // 加密盐值：非空表示对方这次是加密传输
+      final cryptoRaw = json['crypto'];
+      String? salt;
+      if (cryptoRaw is Map) {
+        salt = Map<String, dynamic>.from(cryptoRaw)['salt']?.toString();
+      }
+
+      TransferCrypto? crypto;
+      if (salt != null && salt.isNotEmpty) {
+        final pwd = passphrase;
+        if (pwd == null || pwd.isEmpty) {
+          return Response.badRequest(
+              body: '对方启用了加密传输，但本机没有设置口令');
+        }
+        try {
+          crypto = await TransferCrypto.fromSaltBase64(pwd, salt);
+        } catch (e) {
+          return Response.badRequest(body: '密钥派生失败: $e');
+        }
+      }
+
       final rawFiles = json['files'];
       final files = <FileMeta>[];
       if (rawFiles is List) {
         for (final f in rawFiles) {
-          files.add(FileMeta.fromJson(f));
+          final meta = FileMeta.fromJson(f);
+          if (crypto == null) {
+            files.add(meta);
+            continue;
+          }
+          try {
+            final name = await crypto.decryptName(meta.name);
+            files.add(FileMeta(name: name, size: meta.size));
+          } catch (_) {
+            // GCM 认证失败 = 口令不一致。明确告诉发送方，而不是让它干等超时
+            return Response.badRequest(
+                body: '口令不一致，无法解密文件名，请双方核对口令');
+          }
         }
       }
       if (transferId.isEmpty || files.isEmpty) {
@@ -113,6 +152,7 @@ class TransferServer {
         peerName: senderName,
         peerIp: _peerIpOf(req, json),
         files: files,
+        cryptoSalt: salt,
       );
       _sessions[transferId] = session;
 
@@ -206,16 +246,36 @@ class TransferServer {
 
     IOSink? sink;
     try {
+      // 加密传输：内容要解密后再落盘
+      TransferCrypto? crypto;
+      final salt = session.cryptoSalt;
+      if (salt != null && salt.isNotEmpty) {
+        final pwd = passphrase;
+        if (pwd == null || pwd.isEmpty) {
+          return Response.badRequest(body: '本机未设置口令，无法接收加密文件');
+        }
+        crypto = await TransferCrypto.fromSaltBase64(pwd, salt);
+      }
+
       final path = await uniqueFilePath(saveDir, name);
       sink = File(path).openWrite();
 
       // 逐块读取，实时刷新进度
       var received = 0;
-      await for (final chunk in req.read()) {
-        sink.add(chunk);
-        received += chunk.length;
-        session.fileBytes = received;
-        onSessionChanged(session);
+      if (crypto != null) {
+        await for (final chunk in crypto.decrypt(req.read())) {
+          sink.add(chunk);
+          received += chunk.length;
+          session.fileBytes = received;
+          onSessionChanged(session);
+        }
+      } else {
+        await for (final chunk in req.read()) {
+          sink.add(chunk);
+          received += chunk.length;
+          session.fileBytes = received;
+          onSessionChanged(session);
+        }
       }
       await sink.flush();
       await sink.close();

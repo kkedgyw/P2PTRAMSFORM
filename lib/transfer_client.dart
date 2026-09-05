@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:http/http.dart' as http;
 
+import 'crypto.dart';
 import 'models.dart';
 
 /// 发送端：请求 → 等确认 → 多文件逐个上传
@@ -24,23 +25,48 @@ class TransferClient {
   }
 
   /// 第一步：告知对方要发哪些文件
-  Future<bool> requestTransfer(TransferSession session) async {
+  ///
+  /// [crypto] 非空时进入加密模式：文件名加密后传输，盐值随清单一起发出，
+  /// 对端据此派生同一把密钥。
+  ///
+  /// 返回 null 表示成功；否则返回失败原因（会直接显示给用户，
+  /// 比如「口令不一致」—— 这类信息丢了就只能让用户干等超时）
+  Future<String?> requestTransfer(TransferSession session,
+      {TransferCrypto? crypto}) async {
     try {
+      final files = <Map<String, dynamic>>[];
+      for (final f in session.files) {
+        final name =
+            crypto != null ? await crypto.encryptName(f.name) : f.name;
+        files.add({'name': name, 'size': f.size});
+      }
+
+      final body = <String, dynamic>{
+        'transferId': session.id,
+        'senderName': deviceName,
+        'senderIp': session.peerIp,
+        'files': files,
+        if (crypto != null) 'crypto': {'salt': crypto.saltBase64},
+      };
+
       final res = await http
           .post(
             _uri(session, '/transfer/request'),
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'transferId': session.id,
-              'senderName': deviceName,
-              'senderIp': session.peerIp,
-              'files': session.files.map((f) => f.toJson()).toList(),
-            }),
+            body: jsonEncode(body),
           )
           .timeout(const Duration(seconds: 10));
-      return res.statusCode == 200 || res.statusCode == 202;
-    } catch (_) {
-      return false;
+      if (res.statusCode == 200 || res.statusCode == 202) return null;
+
+      // 4xx 通常是对端给出的具体原因（口令不一致、未设置口令等）
+      if (res.statusCode >= 400 && res.statusCode < 500 && res.body.isNotEmpty) {
+        return res.body;
+      }
+      return '对方返回 HTTP ${res.statusCode}';
+    } on TimeoutException {
+      return '连接超时，请确认对方已打开本应用';
+    } catch (e) {
+      return '无法连接: $e';
     }
   }
 
@@ -71,8 +97,8 @@ class TransferClient {
   }
 
   /// 第三步：多文件逐个上传
-  Future<void> uploadFiles(
-      TransferSession session, List<String> paths) async {
+  Future<void> uploadFiles(TransferSession session, List<String> paths,
+      {TransferCrypto? crypto}) async {
     for (var i = 0; i < paths.length && i < session.files.length; i++) {
       if (session.status == TransferStatus.cancelled) {
         await _notifyCancel(session);
@@ -84,23 +110,33 @@ class TransferClient {
       session.status = TransferStatus.transferring;
       onProgress(session);
 
+      // 加密时文件名也要加密，对端用同一把密钥解回来
+      final fileName = crypto != null
+          ? await crypto.encryptName(session.files[i].name)
+          : session.files[i].name;
+
       final uri = _uri(session, '/transfer/upload', {
         'transferId': session.id,
         'index': '$i',
-        'filename': session.files[i].name,
+        'filename': fileName,
       });
 
       final req = http.StreamedRequest('POST', uri);
-      req.contentLength = session.files[i].size;
+      // 密文比明文长（每 64KB 多 32 字节），长度无法预先确定 → 交给 chunked 编码
+      req.contentLength = crypto != null ? null : session.files[i].size;
 
       var sent = 0;
-      File(paths[i]).openRead().listen(
-        (chunk) {
-          sent += chunk.length;
-          session.fileBytes = sent;
-          onProgress(session);
-          req.sink.add(chunk);
-        },
+      // 进度按明文统计：加密后再数会多算约 0.05%，虽然无感但没必要
+      final counted = _countBytes(File(paths[i]).openRead(), (n) {
+        sent += n;
+        session.fileBytes = sent;
+        onProgress(session);
+      });
+
+      final source = crypto != null ? crypto.encrypt(counted) : counted;
+
+      source.listen(
+        (chunk) => req.sink.add(chunk),
         onDone: () => req.sink.close(),
         onError: (e) => req.sink.addError(e),
         cancelOnError: true,
@@ -121,6 +157,15 @@ class TransferClient {
 
     session.status = TransferStatus.completed;
     onProgress(session);
+  }
+
+  /// 统计流过的明文字节数（用于进度显示），数据原样透传
+  Stream<List<int>> _countBytes(
+      Stream<List<int>> source, void Function(int) onBytes) async* {
+    await for (final chunk in source) {
+      onBytes(chunk.length);
+      yield chunk;
+    }
   }
 
   Future<void> _notifyCancel(TransferSession session) async {

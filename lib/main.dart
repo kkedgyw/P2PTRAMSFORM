@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 
 import 'discovery.dart';
+import 'crypto.dart';
 import 'foreground_service.dart';
 import 'models.dart';
 import 'storage.dart';
@@ -56,6 +57,11 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _storageNote;
   bool _initializing = true;
 
+  /// 端到端加密口令。非空即启用加密
+  String? _passphrase;
+
+  bool get _encryptEnabled => _passphrase != null && _passphrase!.isNotEmpty;
+
   DeviceDiscovery? _discovery;
   StreamSubscription<DiscoveredDevice>? _discoverySub;
   Timer? _cleanupTimer;
@@ -102,12 +108,15 @@ class _HomeScreenState extends State<HomeScreen> {
     _deviceName = _resolveDeviceName();
     _localIps = await refreshLocalIps();
 
+    _passphrase = await AppPrefs.loadPassphrase();
+
     final location = await resolveSaveLocation();
     _applyLocationToState(location);
 
     _server = TransferServer(
       saveDir: _saveDir!,
       deviceName: _deviceName,
+      passphrase: _passphrase,
       onConfirmRequest: _onConfirmRequest,
       onSessionChanged: _onSessionChanged,
     );
@@ -245,13 +254,24 @@ class _HomeScreenState extends State<HomeScreen> {
     );
     _onSessionChanged(session);
 
+    TransferCrypto? crypto;
+    if (_encryptEnabled) {
+      try {
+        crypto = await TransferCrypto.create(_passphrase!);
+      } catch (e) {
+        if (mounted) setState(() => _status = '密钥派生失败: $e');
+        return;
+      }
+    }
+
     setState(() => _status = '等待 ${target.name} 确认...');
     await BackgroundTransferService.start('等待 ${target.name} 确认');
 
     try {
-      final requested = await _client!.requestTransfer(session);
-      if (!requested) {
-        _markFailed(session, '无法连接 ${target.name}，请确认对方在线');
+      final failure =
+          await _client!.requestTransfer(session, crypto: crypto);
+      if (failure != null) {
+        _markFailed(session, failure);
         return;
       }
 
@@ -267,8 +287,9 @@ class _HomeScreenState extends State<HomeScreen> {
       _onSessionChanged(session);
       setState(() => _status = '正在发送给 ${target.name}...');
 
-      await _client!.uploadFiles(session, paths);
-      setState(() => _status = '已发送 ${files.length} 个文件到 ${target.name}');
+      await _client!.uploadFiles(session, paths, crypto: crypto);
+      setState(() => _status = '已发送 ${files.length} 个文件到 ${target.name}'
+          '${crypto != null ? '（已加密）' : ''}');
     } catch (e) {
       _markFailed(session, e.toString());
     } finally {
@@ -330,6 +351,70 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _status = '连接 $ip:$kHttpPort 失败 —— 请确认对方已打开本应用、'
           'IP 填写正确，且未被防火墙拦截');
     }
+  }
+
+  /// 设置端到端加密口令。留空 = 不加密
+  ///
+  /// 安全性的决定性因素是口令强度：密钥由 PBKDF2 派生，弱口令挡不住离线爆破。
+  /// 建议用一个足够长的随机口令，而不是 4~6 位数字。
+  Future<void> _editPassphrase() async {
+    final controller = TextEditingController(text: _passphrase ?? '');
+    final value = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('端到端加密口令'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              '设置后，你发出的文件会被加密，对方只有用相同口令才能解开。\n'
+              '两端口令必须一致。',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              obscureText: true,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: '口令',
+                hintText: '建议使用足够长的随机口令',
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              '安全性取决于口令强度 —— 密钥由 PBKDF2 派生，'
+              '短口令挡不住离线爆破。',
+              style: TextStyle(fontSize: 11, color: Colors.orange),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, ''),
+            child: const Text('关闭加密'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    if (value == null || !mounted) return;
+
+    final enabled = value.isNotEmpty;
+    await AppPrefs.savePassphrase(enabled ? value : null);
+    setState(() {
+      _passphrase = enabled ? value : null;
+      _status = enabled ? '已启用端到端加密' : '已关闭端到端加密';
+    });
+    _server?.passphrase = _passphrase;
   }
 
   /// 扫描本机各网卡所在的 /24 网段。
@@ -413,6 +498,11 @@ class _HomeScreenState extends State<HomeScreen> {
         title: const Text('局域网极速互传'),
         actions: [
           IconButton(
+            icon: Icon(_encryptEnabled ? Icons.lock : Icons.lock_open),
+            tooltip: _encryptEnabled ? '端到端加密已启用' : '未启用端到端加密',
+            onPressed: _editPassphrase,
+          ),
+          IconButton(
             icon: Icon(_scanning ? Icons.stop_circle_outlined : Icons.travel_explore),
             tooltip: _scanning ? '停止扫描' : '扫描网段（虚拟组网 / 跨网段设备用这个）',
             onPressed: _scanSubnets,
@@ -471,6 +561,18 @@ class _HomeScreenState extends State<HomeScreen> {
           const SizedBox(height: 6),
           Text('本机 IP: $ipDisplay',
               style: const TextStyle(color: Colors.grey, fontSize: 13)),
+          if (_encryptEnabled)
+            const Padding(
+              padding: EdgeInsets.only(top: 2),
+              child: Row(
+                children: [
+                  Icon(Icons.lock, size: 13, color: Colors.green),
+                  SizedBox(width: 4),
+                  Text('端到端加密已启用',
+                      style: TextStyle(color: Colors.green, fontSize: 12)),
+                ],
+              ),
+            ),
           if (_saveDir != null) _buildSaveDirInfo(),
         ],
       ),
@@ -580,7 +682,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final picked = await pickSaveDirectory(initialDirectory: _saveDir);
     if (picked == null || !mounted) return;
     try {
-      await SaveDirPrefs.save(picked);
+      await AppPrefs.saveSaveDir(picked);
     } catch (e) {
       if (mounted) setState(() => _status = '保存目录设置失败: $e');
       return;
@@ -592,7 +694,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// 恢复平台默认接收目录
   Future<void> _resetSaveDir() async {
-    await SaveDirPrefs.clear();
+    await AppPrefs.clearSaveDir();
     await _refreshSaveLocation();
     if (!mounted) return;
     setState(() => _status = '已恢复默认接收目录: $_saveDir');

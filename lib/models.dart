@@ -51,6 +51,11 @@ class TransferSession {
   int fileBytes; // 当前文件已传字节
   int bytesDone; // 已完成文件累计字节
   String? error;
+
+  /// 对端发来的盐值（base64）。非空表示本次传输的内容是加密的，
+  /// 接收端要用本地口令 + 这个盐派生密钥才能解密
+  String? cryptoSalt;
+
   final List<String> savedPaths; // 接收端落盘路径
 
   TransferSession({
