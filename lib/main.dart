@@ -5,7 +5,6 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
-import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 
@@ -13,6 +12,7 @@ import 'discovery.dart';
 import 'foreground_service.dart';
 import 'models.dart';
 import 'storage.dart';
+import 'subnet_scan.dart';
 import 'transfer_client.dart';
 import 'transfer_server.dart';
 
@@ -60,6 +60,11 @@ class _HomeScreenState extends State<HomeScreen> {
   StreamSubscription<DiscoveredDevice>? _discoverySub;
   Timer? _cleanupTimer;
 
+  /// 网段扫描器（扫描进行中才有值）
+  SubnetScanner? _scanner;
+  bool _scanning = false;
+  int _scanFound = 0;
+
   TransferServer? _server;
   TransferClient? _client;
 
@@ -102,6 +107,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
     _server = TransferServer(
       saveDir: _saveDir!,
+      deviceName: _deviceName,
       onConfirmRequest: _onConfirmRequest,
       onSessionChanged: _onSessionChanged,
     );
@@ -326,16 +332,61 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  /// 探测对端 HTTP 服务是否可达
-  Future<bool> _probePeer(String ip) async {
-    try {
-      final resp = await http
-          .get(Uri.parse('http://$ip:$kHttpPort/ping'))
-          .timeout(const Duration(seconds: 3));
-      return resp.statusCode == 200;
-    } catch (_) {
-      return false;
+  /// 扫描本机各网卡所在的 /24 网段。
+  ///
+  /// 这是外网（虚拟组网）场景的主力发现方式：EasyTier 的 UDP 广播中继默认关闭
+  /// 且仅 Windows 可用，Android 又天生收不好广播，只有 TCP 探测最可靠。
+  Future<void> _scanSubnets() async {
+    if (_scanning) {
+      _scanner?.cancel();
+      if (mounted) setState(() => _status = '已取消扫描');
+      return;
     }
+
+    _localIps = await refreshLocalIps();
+    if (!mounted) return;
+    if (_localIps.isEmpty) {
+      setState(() => _status = '未获取到本机 IP，无法扫描');
+      return;
+    }
+
+    setState(() {
+      _scanning = true;
+      _scanFound = 0;
+      _status = '正在扫描 ${_localIps.length} 个网段...';
+    });
+
+    _scanner = SubnetScanner(timeout: const Duration(milliseconds: 800));
+    final prefixes = _localIps
+        .map(subnetPrefixOf)
+        .whereType<String>()
+        .toSet()
+        .join('、');
+
+    await for (final device in _scanner!.scan(_localIps)) {
+      if (!mounted) break;
+      // 交给发现层做单播维持，之后不用反复扫描
+      _discovery?.addPeer(device.ip, trusted: false);
+      setState(() {
+        _devices[device.ip] = device;
+        _scanFound++;
+      });
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _scanning = false;
+      _status = _scanFound > 0
+          ? '扫描完成（$prefixes），发现 $_scanFound 台设备'
+          : '扫描完成（$prefixes），未发现设备。'
+              '请确认对方已打开本应用且防火墙放行 $kHttpPort 端口';
+    });
+  }
+
+  /// 探测对端 HTTP 服务是否可达（复用网段扫描的探测逻辑）
+  Future<bool> _probePeer(String ip) async {
+    final info = await probePeer(ip, timeout: const Duration(seconds: 3));
+    return info != null;
   }
 
   /// 没有活跃传输时关闭前台服务
@@ -361,6 +412,11 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('局域网极速互传'),
         actions: [
+          IconButton(
+            icon: Icon(_scanning ? Icons.stop_circle_outlined : Icons.travel_explore),
+            tooltip: _scanning ? '停止扫描' : '扫描网段（虚拟组网 / 跨网段设备用这个）',
+            onPressed: _scanSubnets,
+          ),
           IconButton(
             icon: const Icon(Icons.add_link),
             tooltip: '手动添加设备（发现不到时用 IP 直连）',
@@ -688,13 +744,18 @@ class _HomeScreenState extends State<HomeScreen> {
       return const Center(child: CircularProgressIndicator());
     }
     if (deviceList.isEmpty) {
-      return const Center(
-        child: Text(
-          '正在持续搜索局域网设备...\n'
-          '请确保两台设备在同一子网（已自动排除 VPN 隧道网卡），\n'
-          '且 Windows 防火墙已允许该程序',
-          textAlign: TextAlign.center,
-          style: TextStyle(color: Colors.grey),
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 32),
+          child: Text(
+            '暂未发现设备。\n\n'
+            '同一局域网：等待自动发现，或点右上角扫描。\n'
+            '外网 / 异地（EasyTier、Tailscale 等虚拟组网）：'
+            '两端都装好组网工具并加入同一网络后，点右上角扫描，'
+            '再用「手动添加」填对方虚拟 IP 直连。',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.grey),
+          ),
         ),
       );
     }
@@ -708,7 +769,9 @@ class _HomeScreenState extends State<HomeScreen> {
             leading: CircleAvatar(child: Icon(_deviceIcon(target.os))),
             title: Text(target.name,
                 style: const TextStyle(fontWeight: FontWeight.bold)),
-            subtitle: Text('${target.os.toUpperCase()} • ${target.ip}'),
+            subtitle: Text(
+                '${target.os.toUpperCase()} • ${target.ip}'
+                '${target.viaScan ? ' • 扫描发现' : ''}'),
             trailing: ElevatedButton.icon(
               onPressed: () => _sendFilesTo(target),
               icon: const Icon(Icons.send, size: 16),

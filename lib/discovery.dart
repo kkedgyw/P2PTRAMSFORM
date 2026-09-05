@@ -11,12 +11,39 @@ class DiscoveredDevice {
   final String os;
   DateTime lastSeen;
 
+  /// 是否由网段扫描发现（而非 UDP 广播/单播）
+  final bool viaScan;
+
   DiscoveredDevice({
     required this.ip,
     required this.name,
     required this.os,
     required this.lastSeen,
+    this.viaScan = false,
   });
+
+  /// 所在 /24 网段前缀
+  String get subnet => subnetPrefixOf(ip) ?? '';
+}
+
+/// CGNAT 段 100.64.0.0/10
+///
+/// 两个用途完全相反的场景共用这一段，需要区分对待：
+/// - **Tailscale 等虚拟组网**分配的 IP 就落在这里，必须放行，否则装了 Tailscale
+///   也发现不到设备（它不在 RFC1918 里）
+/// - **运营商 CGNAT / 手机移动网络**也会给到这个段的地址，这种地址从局域网
+///   对端是不可达的
+///
+/// 区分办法：只有当**本机自己也在这一段**时才把对端的同段地址当局域网对待。
+/// 手机 4G 场景下本机确实会拿到 100.64.x.x，但同 /24 校验 + 运营商隔离
+/// 已经把它限制住了，不会污染局域网设备列表。
+bool isCgnatIp(String ip) {
+  final parts = ip.split('.');
+  if (parts.length != 4) return false;
+  final a = int.tryParse(parts[0]);
+  final b = int.tryParse(parts[1]);
+  if (a == null || b == null) return false;
+  return a == 100 && b >= 64 && b <= 127;
 }
 
 /// 是否为局域网私网地址（RFC1918）
@@ -44,7 +71,15 @@ bool isSameSubnetAsLocal(String ip, List<String> localIps) {
   return localIps.any((local) => local.startsWith('$prefix.'));
 }
 
-/// 获取本机所有有效的局域网 IPv4 地址（以太网 / Wi-Fi）
+/// 取 IP 的 /24 网段前缀（192.168.1.5 -> 192.168.1）；非 IPv4 返回 null
+String? subnetPrefixOf(String ip) {
+  final segs = ip.split('.');
+  if (segs.length != 4) return null;
+  return '${segs[0]}.${segs[1]}.${segs[2]}';
+}
+
+/// 获取本机所有有效的局域网 IPv4 地址（以太网 / Wi-Fi / 虚拟组网网卡）（EasyTier 默认 10.126.126.0/24、Tailscale 100.64.0.0/10）
+/// 的网卡也会被计入 —— 外网互传正是靠它们的网段来发现对端。
 Future<List<String>> refreshLocalIps() async {
   final ips = <String>[];
   try {
@@ -62,7 +97,8 @@ Future<List<String>> refreshLocalIps() async {
         continue;
       }
       for (final addr in interface.addresses) {
-        if (!addr.isLoopback && isPrivateLanIp(addr.address)) {
+        if (addr.isLoopback) continue;
+        if (isPrivateLanIp(addr.address) || isCgnatIp(addr.address)) {
           ips.add(addr.address);
         }
       }
@@ -146,7 +182,8 @@ class DeviceDiscovery {
           if (remoteIp == '127.0.0.1') return;
           // 手动添加的对端是用户明确指定的，跳过私网/同子网校验以支持跨网段直连
           if (!_manualPeers.contains(remoteIp)) {
-            if (!isPrivateLanIp(remoteIp)) return;
+            // CGNAT 段单独放行：Tailscale 等设备就落在 100.64.0.0/10
+            if (!isPrivateLanIp(remoteIp) && !isCgnatIp(remoteIp)) return;
             if (!isSameSubnetAsLocal(remoteIp, localIps)) return;
           }
 
@@ -177,11 +214,14 @@ class DeviceDiscovery {
     }
   }
 
-  /// 手动添加对端：跨网段、广播不通时的兜底通道
-  void addPeer(String ip) {
+  /// 记录一个对端，后续靠单播探测维持在线。
+  ///
+  /// [trusted] = true 表示用户明确指定（手动添加），跳过私网/同子网校验以支持跨网段；
+  /// 网段扫描发现的用 false —— 它们本就在本机网段内，走正常校验即可。
+  void addPeer(String ip, {bool trusted = true}) {
     final trimmed = ip.trim();
     if (trimmed.isEmpty) return;
-    _manualPeers.add(trimmed);
+    if (trusted) _manualPeers.add(trimmed);
     _knownPeers[trimmed] = DateTime.now();
     _lastReplyAt.remove(trimmed); // 允许立刻探测，不等下一个周期
     _replyTo(trimmed);

@@ -23,6 +23,10 @@ typedef ConfirmRequest = void Function(
 class TransferServer {
   /// 保存目录。授权状态可能中途变化（用户去设置页开了权限），故不做 final
   String saveDir;
+
+  /// 本设备名称，/ping 与传输请求里带回给对端
+  String deviceName;
+
   final ConfirmRequest onConfirmRequest;
   final void Function(TransferSession session) onSessionChanged;
 
@@ -35,6 +39,7 @@ class TransferServer {
 
   TransferServer({
     required this.saveDir,
+    required this.deviceName,
     required this.onConfirmRequest,
     required this.onSessionChanged,
   });
@@ -45,11 +50,23 @@ class TransferServer {
       ..get('/transfer/status', _handleStatus)
       ..post('/transfer/upload', _handleUpload)
       ..post('/transfer/cancel', _handleCancel)
-      // 存活探测：手动添加设备时用来确认对端在线
-      ..get('/ping', (Request req) => Response.ok('pong'));
+      // 存活探测：网段扫描与手动添加设备都靠它确认对端是本应用
+      ..get('/ping', _handlePing);
 
     _server =
         await shelf_io.serve(router.call, InternetAddress.anyIPv4, kHttpPort);
+  }
+
+  Response _handlePing(Request req) {
+    return Response.ok(
+      jsonEncode({
+        'app': 'p2p_transfer',
+        'name': deviceName,
+        'os': Platform.operatingSystem,
+        'port': kHttpPort,
+      }),
+      headers: {'Content-Type': 'application/json'},
+    );
   }
 
   Future<void> stop() async {
