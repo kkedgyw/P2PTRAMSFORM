@@ -39,7 +39,66 @@ jobs:
           grep -q 'android.permission.FOREGROUND_SERVICE' android/app/src/main/AndroidManifest.xml || { echo "::error::FOREGROUND_SERVICE 权限缺失"; exit 1; }
           echo "manifest 校验通过"
 
-      - name: Install dependencies
+      - name: Install Android SDK 35
+        # androidx.core:1.15.0（flutter_foreground_task 引入）的 AAR metadata 要求 compileSdk >= 35
+        run: |
+          set -e
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SM=""
+          for c in "$SDK/cmdline-tools/latest/bin/sdkmanager" \
+                   "$SDK/cmdline-tools/bin/sdkmanager" \
+                   "$(command -v sdkmanager 2>/dev/null || true)"; do
+            if [ -n "$c" ] && [ -x "$c" ]; then SM="$c"; break; fi
+          done
+          [ -n "$SM" ] || { echo "::error::sdkmanager 未找到"; exit 1; }
+          echo "SDK root = $SDK"
+          echo "sdkmanager = $SM"
+          yes | "$SM" --licenses > /dev/null 2>&1 || true
+          "$SM" --install "platforms;android-35"
+          "$SM" --install "build-tools;35.0.0"
+          ls "$SDK/platforms"
+
+      - name: Upgrade Android toolchain
+        # flutter_foreground_task 9.2.2 硬性要求 Kotlin>=1.9.10、Gradle>=8.6.0；
+        # 且 API 35 官方要求 AGP>=8.6（Flutter 3.24.5 模板默认 Kotlin 1.8.22 / AGP 8.1.0，不满足）
+        run: |
+          set -e
+          BG=android/app/build.gradle
+          SG=android/settings.gradle
+          GW=android/gradle/wrapper/gradle-wrapper.properties
+
+          # 1) Gradle wrapper -> 8.7（AGP 8.6 的最低要求）
+          sed -i 's|distributionUrl=.*|distributionUrl=https\\://services.gradle.org/distributions/gradle-8.7-all.zip|' "$GW"
+
+          # 2) AGP -> 8.6.0（官方支持 compileSdk 35 的最低版本）
+          sed -i 's|\(id "com.android.application" version \)"[0-9.]*"|\1"8.6.0"|' "$SG"
+
+          # 3) Kotlin -> 1.9.24（插件要求 1.9.10+）
+          sed -i 's|\(id "org.jetbrains.kotlin.android" version \)"[0-9.]*"|\1"1.9.24"|' "$SG"
+
+          # 4) compileSdk -> 35（targetSdk 保持 flutter 默认 34，避开 Android 15 行为变更）
+          sed -i 's|flutter\.compileSdkVersion|35|' "$BG"
+
+          grep -n 'gradle-8.7' "$GW"
+          grep -n 'com.android.application" version' "$SG"
+          grep -n 'kotlin.android" version' "$SG"
+          grep -n 'compileSdk' "$BG"
+
+      - name: Verify Android toolchain patching
+        # sed 注入是脆弱环节，版本不对就当场失败，别等到 3 分钟后的 Gradle 才报错
+        run: |
+          set -e
+          grep -q 'gradle-8.7' android/gradle/wrapper/gradle-wrapper.properties \
+            || { echo "::error::Gradle wrapper 未升到 8.7"; exit 1; }
+          grep -q 'com.android.application" version "8.6.0"' android/settings.gradle \
+            || { echo "::error::AGP 未升到 8.6.0"; exit 1; }
+          grep -q 'kotlin.android" version "1.9.24"' android/settings.gradle \
+            || { echo "::error::Kotlin 未升到 1.9.24"; exit 1; }
+          grep -qE 'compileSdk(Version)?[[:space:]]*[= ][[:space:]]*35' android/app/build.gradle \
+            || { echo "::error::compileSdk 未升到 35"; exit 1; }
+          echo "工具链校验通过：Gradle 8.7 / AGP 8.6.0 / Kotlin 1.9.24 / compileSdk 35"
+
+      - name: Install dependencies (Android)
         run: flutter pub get
 
       - name: Build APK
