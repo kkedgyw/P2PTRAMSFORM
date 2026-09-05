@@ -4,9 +4,10 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
-import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 import 'discovery.dart';
 import 'foreground_service.dart';
@@ -146,12 +147,13 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _status = 'UDP 启动异常: ${_discovery!.lastError}');
     }
 
+    // 单播探测每 2 秒一次，宽限到 10 秒可避免对端偶尔丢一个包就被判定离线
     _cleanupTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       if (!mounted) return;
       final now = DateTime.now();
       setState(() {
         _devices
-            .removeWhere((_, d) => now.difference(d.lastSeen).inSeconds > 6);
+            .removeWhere((_, d) => now.difference(d.lastSeen).inSeconds > 10);
       });
     });
   }
@@ -282,6 +284,61 @@ class _HomeScreenState extends State<HomeScreen> {
     unawaited(_maybeStopBackground());
   }
 
+  /// 手动添加设备：广播发现不到时的兜底（Android 广播过滤 / 跨网段 / 路由器隔离）
+  Future<void> _addManualPeer() async {
+    final controller = TextEditingController();
+    final ip = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('手动添加设备'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            labelText: '对方 IP 地址',
+            hintText: '例如 192.168.1.50',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text('添加'),
+          ),
+        ],
+      ),
+    );
+    if (ip == null || ip.isEmpty || !mounted) return;
+
+    setState(() => _status = '正在连接 $ip ...');
+    final ok = await _probePeer(ip);
+    if (!mounted) return;
+
+    if (ok) {
+      _discovery?.addPeer(ip);
+      setState(() => _status = '已添加 $ip，稍等即出现在设备列表');
+    } else {
+      setState(() => _status = '连接 $ip:$kHttpPort 失败 —— 请确认对方已打开本应用、'
+          'IP 填写正确，且未被防火墙拦截');
+    }
+  }
+
+  /// 探测对端 HTTP 服务是否可达
+  Future<bool> _probePeer(String ip) async {
+    try {
+      final resp = await http
+          .get(Uri.parse('http://$ip:$kHttpPort/ping'))
+          .timeout(const Duration(seconds: 3));
+      return resp.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// 没有活跃传输时关闭前台服务
   Future<void> _maybeStopBackground() async {
     final anyActive = _transfers.any((t) => t.isActive);
@@ -305,6 +362,11 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('局域网极速互传'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.add_link),
+            tooltip: '手动添加设备（发现不到时用 IP 直连）',
+            onPressed: _addManualPeer,
+          ),
           IconButton(
             icon: const Icon(Icons.refresh),
             tooltip: '重新扫描',

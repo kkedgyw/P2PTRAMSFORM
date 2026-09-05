@@ -44,7 +44,9 @@ class TransferServer {
       ..post('/transfer/request', _handleRequest)
       ..get('/transfer/status', _handleStatus)
       ..post('/transfer/upload', _handleUpload)
-      ..post('/transfer/cancel', _handleCancel);
+      ..post('/transfer/cancel', _handleCancel)
+      // 存活探测：手动添加设备时用来确认对端在线
+      ..get('/ping', (Request req) => Response.ok('pong'));
 
     _server =
         await shelf_io.serve(router.call, InternetAddress.anyIPv4, kHttpPort);

@@ -71,7 +71,16 @@ Future<List<String>> refreshLocalIps() async {
   return ips;
 }
 
-/// UDP 广播设备发现
+/// UDP 设备发现
+///
+/// ⚠️ Android 接收 UDP **广播**不可靠：系统会过滤掉非发给本机的包，要稳定接收得持有
+/// `WifiManager.MulticastLock`，而纯 Dart 拿不到这个锁。典型症状：
+/// 「PC 能看到安卓，安卓看不到 PC」或「安卓偶尔看到、几秒后消失」。
+///
+/// 解法：**发现不依赖广播接收**。
+///   1. 谁收到广播/探测，就向源 IP **单播**回一份自己的信息 —— 单播在 Android 上可靠
+///   2. 每个周期额外向「已知对端」单播探测，双方借此持续刷新在线状态
+/// 只要有一个方向能通（哪怕安卓一次广播都收不到），双方就能稳定互相看到。
 class DeviceDiscovery {
   final String deviceName;
   final List<String> Function() localIpsProvider;
@@ -79,6 +88,21 @@ class DeviceDiscovery {
   RawDatagramSocket? _socket;
   Timer? _broadcastTimer;
   final _controller = StreamController<DiscoveredDevice>.broadcast();
+
+  /// 已知对端 IP → 最近一次从它收到包的时间（用于单播探测维持在线）
+  final Map<String, DateTime> _knownPeers = {};
+
+  /// 用户手动指定的对端：跳过同子网校验（跨网段直连正是手动添加的意义）
+  final Set<String> _manualPeers = {};
+
+  /// 每个对端上次收到回复的时间，避免每收到一个包就回一个造成风暴
+  final Map<String, DateTime> _lastReplyAt = {};
+
+  /// 超过这个时间没再见到就从探测列表移除
+  static const Duration _peerTtl = Duration(seconds: 90);
+
+  /// 回复限流：同一对端 1.2 秒内最多回一次
+  static const Duration _replyThrottle = Duration(milliseconds: 1200);
 
   Stream<DiscoveredDevice> get onDeviceFound => _controller.stream;
 
@@ -109,6 +133,9 @@ class DeviceDiscovery {
           final parts = message.split('|');
           if (parts.length < 3 || parts[0] != 'P2P_DISCOVER') return;
 
+          // 第 4 段是包类型，老版本没有则按 announce 处理（需要回复）
+          final type = parts.length >= 4 ? parts[3] : 'announce';
+
           final remoteIp = datagram.address.address;
           final localIps = localIpsProvider();
 
@@ -117,8 +144,19 @@ class DeviceDiscovery {
           // 表现为「能看到设备，但一点发送就报错」。
           if (localIps.contains(remoteIp)) return;
           if (remoteIp == '127.0.0.1') return;
-          if (!isPrivateLanIp(remoteIp)) return;
-          if (!isSameSubnetAsLocal(remoteIp, localIps)) return;
+          // 手动添加的对端是用户明确指定的，跳过私网/同子网校验以支持跨网段直连
+          if (!_manualPeers.contains(remoteIp)) {
+            if (!isPrivateLanIp(remoteIp)) return;
+            if (!isSameSubnetAsLocal(remoteIp, localIps)) return;
+          }
+
+          // 记入已知对端，后续靠单播探测维持在线
+          _knownPeers[remoteIp] = DateTime.now();
+
+          // 收到广播/探测就单播回一份自己；reply 不回，否则两家互踢
+          if (type != 'reply') {
+            _replyTo(remoteIp);
+          }
 
           _controller.add(DiscoveredDevice(
             ip: remoteIp,
@@ -139,15 +177,48 @@ class DeviceDiscovery {
     }
   }
 
+  /// 手动添加对端：跨网段、广播不通时的兜底通道
+  void addPeer(String ip) {
+    final trimmed = ip.trim();
+    if (trimmed.isEmpty) return;
+    _manualPeers.add(trimmed);
+    _knownPeers[trimmed] = DateTime.now();
+    _lastReplyAt.remove(trimmed); // 允许立刻探测，不等下一个周期
+    _replyTo(trimmed);
+  }
+
+  /// 向对端单播一份自己的信息（单播在 Android 上不受广播过滤影响）
+  void _replyTo(String peerIp) {
+    final socket = _socket;
+    if (socket == null) return;
+
+    final last = _lastReplyAt[peerIp];
+    final now = DateTime.now();
+    if (last != null && now.difference(last) < _replyThrottle) return;
+    _lastReplyAt[peerIp] = now;
+
+    try {
+      socket.send(
+        utf8.encode(
+            'P2P_DISCOVER|$deviceName|${Platform.operatingSystem}|reply'),
+        InternetAddress(peerIp),
+        kUdpPort,
+      );
+    } catch (_) {}
+  }
+
   void _broadcast() {
     final socket = _socket;
     if (socket == null) return;
     final localIps = localIpsProvider();
-    if (localIps.isEmpty) return;
 
-    final data = utf8.encode('P2P_DISCOVER|$deviceName|${Platform.operatingSystem}');
+    final announce = utf8.encode(
+        'P2P_DISCOVER|$deviceName|${Platform.operatingSystem}|announce');
+    final probe = utf8.encode(
+        'P2P_DISCOVER|$deviceName|${Platform.operatingSystem}|probe');
+
     try {
-      socket.send(data, InternetAddress('255.255.255.255'), kUdpPort);
+      socket.send(announce, InternetAddress('255.255.255.255'), kUdpPort);
     } catch (_) {}
 
     // 针对当前网段的定向广播（如 192.168.1.255）
@@ -156,8 +227,24 @@ class DeviceDiscovery {
       final segs = ip.split('.');
       if (segs.length != 4) continue;
       try {
-        socket.send(data, InternetAddress('${segs[0]}.${segs[1]}.${segs[2]}.255'),
-            kUdpPort);
+        socket.send(announce,
+            InternetAddress('${segs[0]}.${segs[1]}.${segs[2]}.255'), kUdpPort);
+      } catch (_) {}
+    }
+
+    // 向已知对端单播探测：这是安卓端发现对端的主力通道
+    // （广播它收不到，但单播一定能收到）
+    final now = DateTime.now();
+    _knownPeers.removeWhere((ip, seen) {
+      if (now.difference(seen) > _peerTtl) {
+        _lastReplyAt.remove(ip);
+        return true;
+      }
+      return false;
+    });
+    for (final peer in _knownPeers.keys) {
+      try {
+        socket.send(probe, InternetAddress(peer), kUdpPort);
       } catch (_) {}
     }
   }
