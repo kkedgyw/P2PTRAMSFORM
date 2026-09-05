@@ -76,7 +76,31 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
     await _startUdpDiscovery();
   }
 
-  // 获取本机所有有效的 IPv4 地址（支持以太网/Wi-Fi）
+  // 是否为局域网私网地址（RFC1918）
+  // 关键：用白名单而非黑名单，天然排除 VPN 隧道（如 iKuuuVPN 的 198.18.0.0/15
+  // fake-ip 段）、CGNAT(100.64.0.0/10)、APIPA(169.254.0.0/16) 等伪网卡。
+  // 这类地址会导致「能发现设备，但一发送就报错」——因为对端拿到的源 IP 不可达。
+  bool _isPrivateLanIp(String ip) {
+    final parts = ip.split('.');
+    if (parts.length != 4) return false;
+    final a = int.tryParse(parts[0]);
+    final b = int.tryParse(parts[1]);
+    if (a == null || b == null) return false;
+    if (a == 10) return true; // 10.0.0.0/8
+    if (a == 192 && b == 168) return true; // 192.168.0.0/16
+    if (a == 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+    return false;
+  }
+
+  // 对端 IP 是否与本机任一局域网 IP 处于同一 /24 子网
+  bool _isSameSubnetAsLocal(String ip) {
+    final segs = ip.split('.');
+    if (segs.length != 4) return false;
+    final prefix = '${segs[0]}.${segs[1]}.${segs[2]}';
+    return _localIps.any((local) => local.startsWith('$prefix.'));
+  }
+
+  // 获取本机所有有效的局域网 IPv4 地址（支持以太网/Wi-Fi）
   Future<void> _refreshLocalIps() async {
     List<String> ips = [];
     try {
@@ -94,7 +118,7 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
           continue;
         }
         for (var addr in interface.addresses) {
-          if (!addr.isLoopback) {
+          if (!addr.isLoopback && _isPrivateLanIp(addr.address)) {
             ips.add(addr.address);
           }
         }
@@ -118,23 +142,27 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
       final fileName = req.url.queryParameters['filename'] ??
           'file_${DateTime.now().millisecondsSinceEpoch}';
       final file = File('$savePath/$fileName');
-      final sink = file.openWrite();
+      IOSink? sink;
 
       setState(() {
         _status = '正在接收文件: $fileName';
       });
 
       try {
+        sink = file.openWrite();
         await req.read().pipe(sink);
         setState(() {
           _status = '文件接收完成！保存在: $savePath/$fileName';
         });
         return Response.ok('Success');
       } catch (e) {
+        // 出错时务必关闭 sink，否则会残留一个被占用且只写了一半的文件
+        await sink?.close().catchError((_) {});
         setState(() {
           _status = '接收失败: $e';
         });
-        return Response.internalServerError();
+        // 把具体原因回传给发送方，避免只看到一个光秃秃的 500
+        return Response.internalServerError(body: '接收失败: $e');
       }
     });
 
@@ -166,8 +194,13 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
               final remoteOs = parts[2];
               final remoteIp = datagram.address.address;
 
-              // 排除本机的所有网卡 IP
-              if (!_localIps.contains(remoteIp) && remoteIp != '127.0.0.1') {
+              // 只接受「私网地址 且 与本机处于同一 /24 子网」的对端。
+              // 若不做子网校验，VPN 隧道等不可达 IP 会混进设备列表，
+              // 表现为「能看到设备，但一点发送就报错」。
+              if (!_localIps.contains(remoteIp) &&
+                  remoteIp != '127.0.0.1' &&
+                  _isPrivateLanIp(remoteIp) &&
+                  _isSameSubnetAsLocal(remoteIp)) {
                 setState(() {
                   _devices[remoteIp] = DiscoveredDevice(
                     ip: remoteIp,
@@ -256,12 +289,19 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
         cancelOnError: true,
       );
 
-      final res = await req.send();
+      final res =
+          await req.send().timeout(const Duration(seconds: 30));
       if (res.statusCode == 200) {
         setState(() => _status = '发送成功！');
       } else {
-        setState(() => _status = '发送失败: ${res.statusCode}');
+        setState(() => _status = '发送失败: HTTP ${res.statusCode}');
       }
+    } on TimeoutException {
+      setState(
+          () => _status = '发送超时(30s)：对端无响应，请检查 ${target.ip} 的防火墙');
+    } on SocketException catch (e) {
+      setState(() => _status =
+          '连接失败 ${target.ip}:$_httpPort（${e.osError?.message ?? e.message}）');
     } catch (e) {
       setState(() => _status = '发送异常: $e');
     }
@@ -349,7 +389,9 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
             child: deviceList.isEmpty
                 ? const Center(
                     child: Text(
-                      '正在持续搜索局域网设备...\n请确保两台设备在同一子网，且 Windows 防火墙已允许该程序',
+                      '正在持续搜索局域网设备...\n'
+                      '请确保两台设备在同一子网（已自动排除 VPN 隧道网卡），\n'
+                      '且 Windows 防火墙已允许该程序',
                       textAlign: TextAlign.center,
                       style: TextStyle(color: Colors.grey),
                     ),
