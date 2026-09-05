@@ -23,8 +23,21 @@ jobs:
         run: flutter create --project-name p2p_transfer --platforms=android .
 
       - name: Add Android Permissions
+        # 权限必须声明在 <manifest> 下、<application> 之外，故插入 <application 标签之前
         run: |
-          sed -i '/<application/i \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>' android/app/src/main/AndroidManifest.xml
+          sed -i '/<application/i \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <uses-permission android:name="android.permission.WAKE_LOCK"/>' android/app/src/main/AndroidManifest.xml
+
+      - name: Add Foreground Service Declaration
+        # flutter_foreground_task 要求：service 名称不可修改
+        run: |
+          sed -i 's#</application>#    <service android:name="com.pravera.flutter_foreground_task.service.ForegroundService" android:foregroundServiceType="dataSync|remoteMessaging" android:exported="false" />\n    </application>#' android/app/src/main/AndroidManifest.xml
+
+      - name: Verify Android Manifest Patching
+        # sed 注入是脆弱环节，失败就在这一步暴露，别拖到运行时崩溃
+        run: |
+          grep -q 'flutter_foreground_task.service.ForegroundService' android/app/src/main/AndroidManifest.xml || { echo "::error::ForegroundService 未注入 manifest"; exit 1; }
+          grep -q 'android.permission.FOREGROUND_SERVICE' android/app/src/main/AndroidManifest.xml || { echo "::error::FOREGROUND_SERVICE 权限缺失"; exit 1; }
+          echo "manifest 校验通过"
 
       - name: Install dependencies
         run: flutter pub get

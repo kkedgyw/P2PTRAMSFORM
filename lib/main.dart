@@ -1,327 +1,292 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
-import 'package:flutter/material.dart' hide Router;
+import 'dart:math';
+
+import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:shelf/shelf.dart';
-import 'package:shelf/shelf_io.dart' as shelf_io;
-import 'package:shelf_router/shelf_router.dart' as shelf_route;
-import 'package:http/http.dart' as http;
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+
+import 'discovery.dart';
+import 'foreground_service.dart';
+import 'models.dart';
+import 'storage.dart';
+import 'transfer_client.dart';
+import 'transfer_server.dart';
 
 void main() {
-  runApp(const MaterialApp(
-    home: P2PTransferScreen(),
-    debugShowCheckedModeBanner: false,
-  ));
+  // flutter_foreground_task 要求：初始化 UI 与 TaskHandler 的通信端口
+  FlutterForegroundTask.initCommunicationPort();
+  runApp(const P2PTransferApp());
 }
 
-class DiscoveredDevice {
-  final String ip;
-  final String name;
-  final String os;
-  DateTime lastSeen;
-
-  DiscoveredDevice({
-    required this.ip,
-    required this.name,
-    required this.os,
-    required this.lastSeen,
-  });
-}
-
-class P2PTransferScreen extends StatefulWidget {
-  const P2PTransferScreen({super.key});
+class P2PTransferApp extends StatelessWidget {
+  const P2PTransferApp({super.key});
 
   @override
-  State<P2PTransferScreen> createState() => _P2PTransferScreenState();
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: '局域网极速互传',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
+        useMaterial3: true,
+      ),
+      home: const HomeScreen(),
+    );
+  }
 }
 
-class _P2PTransferScreenState extends State<P2PTransferScreen> {
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
   List<String> _localIps = [];
   String _deviceName = '未知设备';
-  HttpServer? _server;
-  RawDatagramSocket? _udpSocket;
-  Timer? _broadcastTimer;
+  String _status = '就绪';
+  String? _saveDir;
+  bool _initializing = true;
+
+  DeviceDiscovery? _discovery;
+  StreamSubscription<DiscoveredDevice>? _discoverySub;
   Timer? _cleanupTimer;
 
-  final Map<String, DiscoveredDevice> _devices = {};
-  String _status = '就绪';
-  double _progress = 0.0;
+  TransferServer? _server;
+  TransferClient? _client;
 
-  static const int _httpPort = 45678;
-  static const int _udpPort = 45679;
+  final Map<String, DiscoveredDevice> _devices = {};
+  final List<TransferSession> _transfers = [];
+
+  // ---------------------------------------------------------------- 生命周期
 
   @override
   void initState() {
     super.initState();
+    BackgroundTransferService.init();
     _initApp();
-  }
-
-  Future<void> _initApp() async {
-    if (Platform.isAndroid) {
-      await [Permission.storage, Permission.manageExternalStorage].request();
-      _deviceName = 'Android Phone';
-    } else if (Platform.isWindows) {
-      _deviceName = Platform.environment['COMPUTERNAME'] ?? 'Windows PC';
-    } else if (Platform.isMacOS) {
-      _deviceName = Platform.environment['USER'] ?? 'Mac';
-    } else {
-      _deviceName = 'Device-${Platform.operatingSystem}';
-    }
-
-    await _refreshLocalIps();
-    await _startReceiverServer();
-    await _startUdpDiscovery();
-  }
-
-  // 是否为局域网私网地址（RFC1918）
-  // 关键：用白名单而非黑名单，天然排除 VPN 隧道（如 iKuuuVPN 的 198.18.0.0/15
-  // fake-ip 段）、CGNAT(100.64.0.0/10)、APIPA(169.254.0.0/16) 等伪网卡。
-  // 这类地址会导致「能发现设备，但一发送就报错」——因为对端拿到的源 IP 不可达。
-  bool _isPrivateLanIp(String ip) {
-    final parts = ip.split('.');
-    if (parts.length != 4) return false;
-    final a = int.tryParse(parts[0]);
-    final b = int.tryParse(parts[1]);
-    if (a == null || b == null) return false;
-    if (a == 10) return true; // 10.0.0.0/8
-    if (a == 192 && b == 168) return true; // 192.168.0.0/16
-    if (a == 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
-    return false;
-  }
-
-  // 对端 IP 是否与本机任一局域网 IP 处于同一 /24 子网
-  bool _isSameSubnetAsLocal(String ip) {
-    final segs = ip.split('.');
-    if (segs.length != 4) return false;
-    final prefix = '${segs[0]}.${segs[1]}.${segs[2]}';
-    return _localIps.any((local) => local.startsWith('$prefix.'));
-  }
-
-  // 获取本机所有有效的局域网 IPv4 地址（支持以太网/Wi-Fi）
-  Future<void> _refreshLocalIps() async {
-    List<String> ips = [];
-    try {
-      final interfaces = await NetworkInterface.list(
-        type: InternetAddressType.IPv4,
-        includeLinkLocal: false,
-      );
-      for (var interface in interfaces) {
-        // 过滤虚拟机/虚拟网卡（如 WSL, Docker, VMware）
-        final name = interface.name.toLowerCase();
-        if (name.contains('vethernet') ||
-            name.contains('vmware') ||
-            name.contains('vbox') ||
-            name.contains('docker')) {
-          continue;
-        }
-        for (var addr in interface.addresses) {
-          if (!addr.isLoopback && _isPrivateLanIp(addr.address)) {
-            ips.add(addr.address);
-          }
-        }
-      }
-    } catch (_) {}
-
-    setState(() {
-      _localIps = ips;
-    });
-  }
-
-  // 1. 启动 HTTP 接收服务（监听 0.0.0.0 涵盖所有网卡）
-  Future<void> _startReceiverServer() async {
-    final router = shelf_route.Router();
-    final dir = Platform.isAndroid
-        ? await getExternalStorageDirectory()
-        : await getApplicationDocumentsDirectory();
-    final savePath = dir?.path ?? '.';
-
-    router.post('/upload', (Request req) async {
-      final fileName = req.url.queryParameters['filename'] ??
-          'file_${DateTime.now().millisecondsSinceEpoch}';
-      final file = File('$savePath/$fileName');
-      IOSink? sink;
-
-      setState(() {
-        _status = '正在接收文件: $fileName';
-      });
-
-      try {
-        sink = file.openWrite();
-        await req.read().pipe(sink);
-        setState(() {
-          _status = '文件接收完成！保存在: $savePath/$fileName';
-        });
-        return Response.ok('Success');
-      } catch (e) {
-        // 出错时务必关闭 sink，否则会残留一个被占用且只写了一半的文件
-        await sink?.close().catchError((_) {});
-        setState(() {
-          _status = '接收失败: $e';
-        });
-        // 把具体原因回传给发送方，避免只看到一个光秃秃的 500
-        return Response.internalServerError(body: '接收失败: $e');
-      }
-    });
-
-    _server =
-        await shelf_io.serve(router.call, InternetAddress.anyIPv4, _httpPort);
-  }
-
-  // 2. 启动 UDP 广播（支持有线/无线双向发现）
-  Future<void> _startUdpDiscovery() async {
-    try {
-      _udpSocket = await RawDatagramSocket.bind(
-        InternetAddress.anyIPv4,
-        _udpPort,
-        reuseAddress: true,
-        reusePort: false,
-      );
-      _udpSocket?.broadcastEnabled = true;
-
-      _udpSocket?.listen((event) {
-        if (event == RawSocketEvent.read) {
-          final datagram = _udpSocket?.receive();
-          if (datagram == null) return;
-
-          try {
-            final message = utf8.decode(datagram.data);
-            final parts = message.split('|');
-            if (parts.length >= 3 && parts[0] == 'P2P_DISCOVER') {
-              final remoteDeviceName = parts[1];
-              final remoteOs = parts[2];
-              final remoteIp = datagram.address.address;
-
-              // 只接受「私网地址 且 与本机处于同一 /24 子网」的对端。
-              // 若不做子网校验，VPN 隧道等不可达 IP 会混进设备列表，
-              // 表现为「能看到设备，但一点发送就报错」。
-              if (!_localIps.contains(remoteIp) &&
-                  remoteIp != '127.0.0.1' &&
-                  _isPrivateLanIp(remoteIp) &&
-                  _isSameSubnetAsLocal(remoteIp)) {
-                setState(() {
-                  _devices[remoteIp] = DiscoveredDevice(
-                    ip: remoteIp,
-                    name: remoteDeviceName,
-                    os: remoteOs,
-                    lastSeen: DateTime.now(),
-                  );
-                });
-              }
-            }
-          } catch (_) {}
-        }
-      });
-
-      _broadcastTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
-        if (_udpSocket == null || _localIps.isEmpty) return;
-        final packet = 'P2P_DISCOVER|$_deviceName|${Platform.operatingSystem}';
-        final data = utf8.encode(packet);
-
-        // 1. 全局广播
-        try {
-          _udpSocket?.send(
-              data, InternetAddress('255.255.255.255'), _udpPort);
-        } catch (_) {}
-
-        // 2. 针对当前网段的定向广播 (如 192.168.1.255)
-        // 部分路由器/交换机不转发全局广播，定向广播可提升发现成功率
-        for (final ip in _localIps) {
-          final segments = ip.split('.');
-          if (segments.length == 4) {
-            final subnetBroadcast =
-                '${segments[0]}.${segments[1]}.${segments[2]}.255';
-            try {
-              _udpSocket?.send(
-                  data, InternetAddress(subnetBroadcast), _udpPort);
-            } catch (_) {}
-          }
-        }
-      });
-
-      _cleanupTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
-        final now = DateTime.now();
-        setState(() {
-          _devices.removeWhere(
-              (_, device) => now.difference(device.lastSeen).inSeconds > 6);
-        });
-      });
-    } catch (e) {
-      setState(() => _status = 'UDP 启动异常: $e');
-    }
-  }
-
-  Future<void> _sendFileToDevice(DiscoveredDevice target) async {
-    final result = await FilePicker.platform.pickFiles();
-    if (result == null || result.files.isEmpty) return;
-
-    final filePath = result.files.single.path;
-    if (filePath == null) return;
-
-    final file = File(filePath);
-    final fileName = Uri.encodeComponent(result.files.single.name);
-    final uri =
-        Uri.parse('http://${target.ip}:$_httpPort/upload?filename=$fileName');
-
-    setState(() {
-      _status = '正在发送至 ${target.name}...';
-      _progress = 0.0;
-    });
-
-    try {
-      final req = http.StreamedRequest('POST', uri);
-      final total = await file.length();
-      req.contentLength = total;
-
-      int sent = 0;
-      file.openRead().listen(
-        (chunk) {
-          sent += chunk.length;
-          setState(() {
-            _progress = total > 0 ? sent / total : 0;
-          });
-          req.sink.add(chunk);
-        },
-        onDone: () => req.sink.close(),
-        onError: (e) => req.sink.addError(e),
-        cancelOnError: true,
-      );
-
-      final res =
-          await req.send().timeout(const Duration(seconds: 30));
-      if (res.statusCode == 200) {
-        setState(() => _status = '发送成功！');
-      } else {
-        setState(() => _status = '发送失败: HTTP ${res.statusCode}');
-      }
-    } on TimeoutException {
-      setState(
-          () => _status = '发送超时(30s)：对端无响应，请检查 ${target.ip} 的防火墙');
-    } on SocketException catch (e) {
-      setState(() => _status =
-          '连接失败 ${target.ip}:$_httpPort（${e.osError?.message ?? e.message}）');
-    } catch (e) {
-      setState(() => _status = '发送异常: $e');
-    }
   }
 
   @override
   void dispose() {
-    _broadcastTimer?.cancel();
     _cleanupTimer?.cancel();
-    _udpSocket?.close();
-    _server?.close(force: true);
+    _discoverySub?.cancel();
+    _discovery?.stop();
+    _server?.stop();
     super.dispose();
   }
 
-  IconData _getDeviceIcon(String os) {
-    if (os.toLowerCase().contains('android')) return Icons.phone_android;
-    if (os.toLowerCase().contains('windows')) return Icons.desktop_windows;
-    if (os.toLowerCase().contains('macos')) return Icons.laptop_mac;
-    return Icons.devices;
+  Future<void> _initApp() async {
+    if (Platform.isAndroid) {
+      // notification: Android 13+ 前台服务通知需要运行时权限
+      await [
+        Permission.storage,
+        Permission.manageExternalStorage,
+        Permission.notification,
+      ].request();
+    }
+
+    _deviceName = _resolveDeviceName();
+    _localIps = await refreshLocalIps();
+    _saveDir = await resolveSaveDir();
+
+    _server = TransferServer(
+      saveDir: _saveDir!,
+      onConfirmRequest: _onConfirmRequest,
+      onSessionChanged: _onSessionChanged,
+    );
+    await _server!.start();
+
+    _client =
+        TransferClient(deviceName: _deviceName, onProgress: _onSessionChanged);
+
+    await _startDiscovery();
+
+    if (mounted) {
+      setState(() {
+        _initializing = false;
+        _status = '就绪 · 接收保存到: $_saveDir';
+      });
+    }
   }
+
+  String _resolveDeviceName() {
+    if (Platform.isAndroid) return 'Android Phone';
+    if (Platform.isWindows) {
+      return Platform.environment['COMPUTERNAME'] ?? 'Windows PC';
+    }
+    if (Platform.isMacOS) return Platform.environment['USER'] ?? 'Mac';
+    if (Platform.isLinux) return Platform.environment['HOSTNAME'] ?? 'Linux';
+    return 'Device-${Platform.operatingSystem}';
+  }
+
+  Future<void> _startDiscovery() async {
+    _discovery = DeviceDiscovery(
+      deviceName: _deviceName,
+      localIpsProvider: () => _localIps,
+    );
+
+    _discoverySub = _discovery!.onDeviceFound.listen((device) {
+      if (!mounted) return;
+      setState(() => _devices[device.ip] = device);
+    });
+
+    final ok = await _discovery!.start();
+    if (!ok && mounted) {
+      setState(() => _status = 'UDP 启动异常: ${_discovery!.lastError}');
+    }
+
+    _cleanupTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      if (!mounted) return;
+      final now = DateTime.now();
+      setState(() {
+        _devices
+            .removeWhere((_, d) => now.difference(d.lastSeen).inSeconds > 6);
+      });
+    });
+  }
+
+  // ---------------------------------------------------------------- 传输逻辑
+
+  /// 会话状态变化：刷新 UI + 同步 Android 常驻通知
+  void _onSessionChanged(TransferSession session) {
+    if (!mounted) return;
+    setState(() {
+      final idx = _transfers.indexWhere((t) => t.id == session.id);
+      if (idx >= 0) {
+        _transfers[idx] = session;
+      } else {
+        _transfers.insert(0, session);
+      }
+    });
+
+    if (session.isActive) {
+      final verb = session.direction == TransferDirection.send ? '发送' : '接收';
+      BackgroundTransferService.update(
+          '$verb ${(session.progress * 100).toStringAsFixed(0)}%');
+    } else {
+      unawaited(_maybeStopBackground());
+    }
+  }
+
+  /// 收到对端传输请求 → 弹确认框
+  void _onConfirmRequest(TransferSession session, Completer<bool> decision) {
+    if (!mounted) {
+      decision.complete(false);
+      return;
+    }
+    setState(() {
+      if (!_transfers.any((t) => t.id == session.id)) {
+        _transfers.insert(0, session);
+      }
+    });
+
+    Timer? autoReject;
+
+    showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => _ConfirmDialog(session: session),
+    ).then((ok) {
+      autoReject?.cancel();
+      final accepted = ok == true;
+      _server?.resolve(session.id, accepted);
+      if (mounted) {
+        setState(() => _status = accepted ? '已接受传输，等待接收' : '已拒绝该传输');
+      }
+    });
+
+    // 用户 55 秒未响应则自动关闭对话框（服务端 60 秒超时拒绝）
+    autoReject = Timer(const Duration(seconds: 55), () {
+      if (mounted && Navigator.of(context).canPop()) {
+        Navigator.of(context).pop(false);
+      }
+    });
+  }
+
+  /// 多文件发送
+  Future<void> _sendFilesTo(DiscoveredDevice target) async {
+    final result = await FilePicker.platform.pickFiles(allowMultiple: true);
+    if (result == null || result.files.isEmpty) return;
+
+    final files = <FileMeta>[];
+    final paths = <String>[];
+    for (final f in result.files) {
+      final path = f.path;
+      if (path == null) continue;
+      files.add(FileMeta(name: f.name, size: f.size));
+      paths.add(path);
+    }
+    if (files.isEmpty) return;
+
+    final session = TransferSession(
+      id: _newTransferId(),
+      direction: TransferDirection.send,
+      peerName: target.name,
+      peerIp: target.ip,
+      files: files,
+    );
+    _onSessionChanged(session);
+
+    setState(() => _status = '等待 ${target.name} 确认...');
+    await BackgroundTransferService.start('等待 ${target.name} 确认');
+
+    try {
+      final requested = await _client!.requestTransfer(session);
+      if (!requested) {
+        _markFailed(session, '无法连接 ${target.name}，请确认对方在线');
+        return;
+      }
+
+      final accepted = await _client!.waitForDecision(session);
+      if (!accepted) {
+        session.status = TransferStatus.rejected;
+        _onSessionChanged(session);
+        setState(() => _status = '${target.name} 拒绝了传输');
+        return;
+      }
+
+      session.status = TransferStatus.accepted;
+      _onSessionChanged(session);
+      setState(() => _status = '正在发送给 ${target.name}...');
+
+      await _client!.uploadFiles(session, paths);
+      setState(() => _status = '已发送 ${files.length} 个文件到 ${target.name}');
+    } catch (e) {
+      _markFailed(session, e.toString());
+    } finally {
+      await _maybeStopBackground();
+    }
+  }
+
+  void _markFailed(TransferSession session, String error) {
+    session.status = TransferStatus.failed;
+    session.error = error;
+    _onSessionChanged(session);
+    if (mounted) setState(() => _status = '发送失败: $error');
+  }
+
+  void _cancelTransfer(TransferSession session) {
+    session.status = TransferStatus.cancelled;
+    _onSessionChanged(session);
+    unawaited(_maybeStopBackground());
+  }
+
+  /// 没有活跃传输时关闭前台服务
+  Future<void> _maybeStopBackground() async {
+    final anyActive = _transfers.any((t) => t.isActive);
+    if (!anyActive) await BackgroundTransferService.stop();
+  }
+
+  String _newTransferId() {
+    final r = Random();
+    return '${DateTime.now().millisecondsSinceEpoch}-${r.nextInt(1 << 30)}';
+  }
+
+  // ---------------------------------------------------------------- 界面
 
   @override
   Widget build(BuildContext context) {
@@ -335,104 +300,308 @@ class _P2PTransferScreenState extends State<P2PTransferScreen> {
         actions: [
           IconButton(
             icon: const Icon(Icons.refresh),
-            onPressed: () {
-              _refreshLocalIps();
+            tooltip: '重新扫描',
+            onPressed: () async {
+              _localIps = await refreshLocalIps();
+              if (!mounted) return;
               setState(() => _devices.clear());
             },
-            tooltip: '重新扫描',
           ),
         ],
       ),
       body: Column(
         children: [
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(16),
-            color: Theme.of(context).colorScheme.surfaceContainerHighest,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Icon(_getDeviceIcon(Platform.operatingSystem), size: 28),
-                    const SizedBox(width: 8),
-                    Text(
-                      _deviceName,
-                      style: const TextStyle(
-                          fontWeight: FontWeight.bold, fontSize: 16),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                Text('本机 IP: $ipDisplay',
-                    style: const TextStyle(color: Colors.grey, fontSize: 13)),
-              ],
-            ),
-          ),
-          if (_progress > 0 && _progress < 1)
-            LinearProgressIndicator(value: _progress),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Row(
-              children: [
-                const SizedBox(
-                    width: 12,
-                    height: 12,
-                    child: CircularProgressIndicator(strokeWidth: 2)),
-                const SizedBox(width: 8),
-                Text('在线设备 (${deviceList.length})',
-                    style: const TextStyle(fontWeight: FontWeight.bold)),
-              ],
-            ),
-          ),
-          Expanded(
-            child: deviceList.isEmpty
-                ? const Center(
-                    child: Text(
-                      '正在持续搜索局域网设备...\n'
-                      '请确保两台设备在同一子网（已自动排除 VPN 隧道网卡），\n'
-                      '且 Windows 防火墙已允许该程序',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: Colors.grey),
-                    ),
-                  )
-                : ListView.builder(
-                    itemCount: deviceList.length,
-                    itemBuilder: (context, index) {
-                      final target = deviceList[index];
-                      return Card(
-                        margin: const EdgeInsets.symmetric(
-                            horizontal: 16, vertical: 6),
-                        child: ListTile(
-                          leading:
-                              CircleAvatar(child: Icon(_getDeviceIcon(target.os))),
-                          title: Text(target.name,
-                              style:
-                                  const TextStyle(fontWeight: FontWeight.bold)),
-                          subtitle:
-                              Text('${target.os.toUpperCase()} • ${target.ip}'),
-                          trailing: ElevatedButton.icon(
-                            onPressed: () => _sendFileToDevice(target),
-                            icon: const Icon(Icons.send, size: 16),
-                            label: const Text('发送'),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-          ),
-          Container(
-            padding: const EdgeInsets.all(12),
-            color: Colors.black12,
-            child: Text(
-              '状态: $_status',
-              style: const TextStyle(fontSize: 12),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
+          _buildSelfCard(ipDisplay),
+          if (_transfers.isNotEmpty) _buildTransferPanel(),
+          _buildDeviceHeader(deviceList.length),
+          Expanded(child: _buildDeviceList(deviceList)),
+          _buildStatusBar(),
         ],
       ),
+    );
+  }
+
+  Widget _buildSelfCard(String ipDisplay) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(_deviceIcon(Platform.operatingSystem), size: 28),
+              const SizedBox(width: 8),
+              Text(_deviceName,
+                  style: const TextStyle(
+                      fontWeight: FontWeight.bold, fontSize: 16)),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text('本机 IP: $ipDisplay',
+              style: const TextStyle(color: Colors.grey, fontSize: 13)),
+          if (_saveDir != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text('接收保存到: $_saveDir',
+                  style: const TextStyle(color: Colors.grey, fontSize: 12)),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTransferPanel() {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxHeight: 230),
+      child: Container(
+        decoration: BoxDecoration(
+          border:
+              Border(bottom: BorderSide(color: Theme.of(context).dividerColor)),
+        ),
+        child: ListView.builder(
+          shrinkWrap: true,
+          itemCount: _transfers.length,
+          itemBuilder: (context, index) =>
+              _buildTransferTile(_transfers[index]),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTransferTile(TransferSession s) {
+    final isSend = s.direction == TransferDirection.send;
+    final color = _statusColor(s.status);
+
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      child: Padding(
+        padding: const EdgeInsets.all(10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(isSend ? Icons.upload : Icons.download,
+                    size: 18, color: color),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    '${isSend ? '发给' : '来自'} ${s.peerName} · '
+                    '${s.files.length} 个文件 · ${formatBytes(s.totalBytes)}',
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                Text(s.statusLabel,
+                    style: TextStyle(fontSize: 12, color: color)),
+              ],
+            ),
+            const SizedBox(height: 6),
+            if (s.status == TransferStatus.transferring)
+              LinearProgressIndicator(value: s.progress),
+            const SizedBox(height: 4),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    _progressText(s),
+                    style: const TextStyle(fontSize: 11, color: Colors.grey),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                // 待确认的接收请求：除了弹窗，列表里也给一组按钮兜底
+                if (s.status == TransferStatus.pending &&
+                    s.direction == TransferDirection.receive) ...[
+                  TextButton(
+                    onPressed: () => _server?.resolve(s.id, false),
+                    child: const Text('拒绝'),
+                  ),
+                  TextButton(
+                    onPressed: () => _server?.resolve(s.id, true),
+                    child: const Text('接受'),
+                  ),
+                ],
+                if (s.isActive)
+                  TextButton(
+                    onPressed: () => _cancelTransfer(s),
+                    child: const Text('取消'),
+                  ),
+              ],
+            ),
+            if (s.error != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Text('错误: ${s.error}',
+                    style: const TextStyle(fontSize: 11, color: Colors.red)),
+              ),
+            if (s.savedPaths.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Text('已保存 ${s.savedPaths.length} 个文件',
+                    style: const TextStyle(fontSize: 11, color: Colors.grey)),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDeviceHeader(int count) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Row(
+        children: [
+          const SizedBox(
+            width: 12,
+            height: 12,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: 8),
+          Text('在线设备 ($count)',
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDeviceList(List<DiscoveredDevice> deviceList) {
+    if (_initializing) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (deviceList.isEmpty) {
+      return const Center(
+        child: Text(
+          '正在持续搜索局域网设备...\n'
+          '请确保两台设备在同一子网（已自动排除 VPN 隧道网卡），\n'
+          '且 Windows 防火墙已允许该程序',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Colors.grey),
+        ),
+      );
+    }
+    return ListView.builder(
+      itemCount: deviceList.length,
+      itemBuilder: (context, index) {
+        final target = deviceList[index];
+        return Card(
+          margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+          child: ListTile(
+            leading: CircleAvatar(child: Icon(_deviceIcon(target.os))),
+            title: Text(target.name,
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: Text('${target.os.toUpperCase()} • ${target.ip}'),
+            trailing: ElevatedButton.icon(
+              onPressed: () => _sendFilesTo(target),
+              icon: const Icon(Icons.send, size: 16),
+              label: const Text('发送'),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildStatusBar() {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      color: Colors.black12,
+      child: Text(
+        '状态: $_status',
+        style: const TextStyle(fontSize: 12),
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+      ),
+    );
+  }
+
+  String _progressText(TransferSession s) {
+    switch (s.status) {
+      case TransferStatus.transferring:
+        final name = s.currentFile?.name ?? '';
+        final pct = (s.progress * 100).toStringAsFixed(0);
+        return '$name · ${formatBytes(s.bytesDone + s.fileBytes)}'
+            '/${formatBytes(s.totalBytes)} ($pct%)';
+      case TransferStatus.completed:
+        return '完成 · ${formatBytes(s.totalBytes)}';
+      case TransferStatus.pending:
+        return s.direction == TransferDirection.receive
+            ? '等待你确认'
+            : '等待对方确认';
+      default:
+        return s.statusLabel;
+    }
+  }
+
+  Color _statusColor(TransferStatus status) {
+    switch (status) {
+      case TransferStatus.completed:
+        return Colors.green;
+      case TransferStatus.failed:
+        return Colors.red;
+      case TransferStatus.rejected:
+      case TransferStatus.cancelled:
+        return Colors.grey;
+      default:
+        return Colors.blue;
+    }
+  }
+
+  IconData _deviceIcon(String os) {
+    final o = os.toLowerCase();
+    if (o.contains('android')) return Icons.phone_android;
+    if (o.contains('windows')) return Icons.desktop_windows;
+    if (o.contains('macos')) return Icons.laptop_mac;
+    if (o.contains('linux')) return Icons.computer;
+    return Icons.devices;
+  }
+}
+
+/// 接收确认对话框
+class _ConfirmDialog extends StatelessWidget {
+  final TransferSession session;
+  const _ConfirmDialog({required this.session});
+
+  @override
+  Widget build(BuildContext context) {
+    final files = session.files;
+    return AlertDialog(
+      title: const Text('收到传输请求'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('来自：${session.peerName}'
+                '${session.peerIp.isEmpty ? '' : '（${session.peerIp}）'}'),
+            const SizedBox(height: 8),
+            Text(
+              '共 ${files.length} 个文件，${formatBytes(session.totalBytes)}',
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            ...files.take(5).map((f) => Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Text('• ${f.name}（${formatBytes(f.size)}）'),
+                )),
+            if (files.length > 5)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text('…等共 ${files.length} 个'),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('拒绝'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text('接受'),
+        ),
+      ],
     );
   }
 }
