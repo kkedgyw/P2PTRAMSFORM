@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -11,23 +12,110 @@ class SaveLocation {
   /// 是否是用户能在文件管理器里直接看到的公共目录
   final bool isPublic;
 
+  /// 是否是用户在设置里手动指定的目录
+  final bool isCustom;
+
   /// 没能落到公共目录时的说明（供 UI 提示）
   final String? note;
 
-  SaveLocation(this.path, {this.isPublic = false, this.note});
+  SaveLocation(this.path,
+      {this.isPublic = false, this.isCustom = false, this.note});
+}
+
+/// 用户手动指定的保存目录，持久化到应用支持目录下的一个 JSON 文件。
+///
+/// 用文件而不是 shared_preferences，是为了不再引入新依赖（桌面端各平台的
+/// 注册表/GSettings 后端行为不一致，反而更容易出问题）。
+class SaveDirPrefs {
+  static const _fileName = 'save_dir.json';
+
+  static Future<File> _prefsFile() async {
+    final dir = await getApplicationSupportDirectory();
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    return File(p.join(dir.path, _fileName));
+  }
+
+  static Future<String?> load() async {
+    try {
+      final file = await _prefsFile();
+      if (!await file.exists()) return null;
+      final raw = await file.readAsString();
+      if (raw.trim().isEmpty) return null;
+      // 手写解析，避免为一行 JSON 引入 dart:convert 之外的东西
+      final m = RegExp('"path"\\s*:\\s*"(.*?)"').firstMatch(raw);
+      final path = m?.group(1);
+      if (path == null || path.isEmpty) return null;
+      // 注意：单个反斜杠不能写成 r'\' —— raw string 里 \' 仍会转义单引号，
+      // 导致字符串无法终止。统一用普通字符串写法。
+      return path.replaceAll('\\"', '"').replaceAll('\\\\', '\\');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> save(String path) async {
+    final escaped = path.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+    await (await _prefsFile()).writeAsString('{"path": "$escaped"}');
+  }
+
+  static Future<void> clear() async {
+    try {
+      final file = await _prefsFile();
+      if (await file.exists()) await file.delete();
+    } catch (_) {}
+  }
+}
+
+/// 让用户选择接收目录。
+///
+/// ⚠️ 只在桌面端（Windows/macOS/Linux）可用。Android 上 file_picker 的
+/// getDirectoryPath 走 SAF，返回的是 content:// 形式或受限路径，Dart 侧的
+/// File API 直接写会失败（需要拿 URI 持久化权限），Android 端仍走公共 Downloads。
+Future<String?> pickSaveDirectory({String? initialDirectory}) async {
+  if (Platform.isAndroid || Platform.isIOS) return null;
+  try {
+    return await FilePicker.platform.getDirectoryPath(
+      dialogTitle: '选择接收文件的保存目录',
+      initialDirectory: initialDirectory,
+    );
+  } catch (_) {
+    return null;
+  }
 }
 
 /// 解析接收文件的保存目录
 ///
-/// Android 优先公共 Downloads（/storage/emulated/0/Download/P2PTransfer）。
-///
-/// ⚠️ 注意：不要用 `getExternalStorageDirectories()` 的结果当公共目录 ——
-/// 它走的是 `Context.getExternalFilesDirs()`，返回的是
-/// `/storage/emulated/0/Android/data/<pkg>/files/Download`，是 **app 私有目录**。
-/// Android 11+ 起文件管理器无法浏览 Android/data，表现为「传输成功但找不到文件」。
-/// 真正的公共目录要从外部存储根拼出来，且需要「所有文件访问权限」
-/// (MANAGE_EXTERNAL_STORAGE) 才能写入；该权限在 Play 上架受限，侧载分发不受影响。
+/// 优先级：用户手动指定的目录（仍可写时）> 平台默认目录。
+/// 自定义目录失效（被删 / 权限丢失）时不静默丢弃，而是回退并给出可读原因。
 Future<SaveLocation> resolveSaveLocation() async {
+  final custom = await SaveDirPrefs.load();
+  if (custom != null && custom.isNotEmpty) {
+    final dir = Directory(custom);
+    try {
+      if (!await dir.exists()) {
+        await dir.create(recursive: true);
+      }
+    } catch (_) {}
+    if (await _isWritable(dir)) {
+      return SaveLocation(custom, isPublic: true, isCustom: true);
+    }
+
+    final fallback = await _defaultLocation();
+    return SaveLocation(
+      fallback.path,
+      isPublic: fallback.isPublic,
+      isCustom: true,
+      note: '自定义的接收目录已失效（被删除或无写入权限）：$custom\n'
+          '已临时改用: ${fallback.path}',
+    );
+  }
+  return _defaultLocation();
+}
+
+/// 平台默认保存目录
+Future<SaveLocation> _defaultLocation() async {
   if (Platform.isAndroid) {
     final public = await _androidPublicDownloads();
     if (public != null) {

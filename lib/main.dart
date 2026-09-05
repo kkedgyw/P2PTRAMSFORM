@@ -52,6 +52,7 @@ class _HomeScreenState extends State<HomeScreen> {
   String _status = '就绪';
   String? _saveDir;
   bool _publicStorage = false;
+  bool _saveDirCustom = false;
   String? _storageNote;
   bool _initializing = true;
 
@@ -97,9 +98,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _localIps = await refreshLocalIps();
 
     final location = await resolveSaveLocation();
-    _saveDir = location.path;
-    _publicStorage = location.isPublic;
-    _storageNote = location.note;
+    _applyLocationToState(location);
 
     _server = TransferServer(
       saveDir: _saveDir!,
@@ -367,6 +366,12 @@ class _HomeScreenState extends State<HomeScreen> {
             tooltip: '手动添加设备（发现不到时用 IP 直连）',
             onPressed: _addManualPeer,
           ),
+          if (_canPickSaveDir)
+            IconButton(
+              icon: const Icon(Icons.folder_open),
+              tooltip: '选择接收目录',
+              onPressed: _pickSaveDir,
+            ),
           IconButton(
             icon: const Icon(Icons.refresh),
             tooltip: '重新扫描',
@@ -434,7 +439,8 @@ class _HomeScreenState extends State<HomeScreen> {
                   size: 14, color: warning ? Colors.orange : Colors.grey),
               const SizedBox(width: 4),
               Expanded(
-                child: Text('接收保存到: $dir',
+                child: Text(
+                    '接收保存到${_saveDirCustom ? '（自定义）' : ''}: $dir',
                     style: const TextStyle(color: Colors.grey, fontSize: 12)),
               ),
             ],
@@ -459,22 +465,81 @@ class _HomeScreenState extends State<HomeScreen> {
                     style: TextStyle(fontSize: 12)),
               ),
             ),
+          // 桌面端可自由指定接收目录；Android 走系统公共 Downloads，不提供该项
+          if (_canPickSaveDir)
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextButton(
+                  style: _smallButtonStyle,
+                  onPressed: _pickSaveDir,
+                  child: const Text('更改', style: TextStyle(fontSize: 12)),
+                ),
+                if (_saveDirCustom)
+                  TextButton(
+                    style: _smallButtonStyle,
+                    onPressed: _resetSaveDir,
+                    child:
+                        const Text('恢复默认', style: TextStyle(fontSize: 12)),
+                  ),
+              ],
+            ),
         ],
       ),
     );
   }
 
+  ButtonStyle get _smallButtonStyle => TextButton.styleFrom(
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        minimumSize: const Size(0, 28),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      );
+
+  /// 桌面端才能让用户选目录（Android 的 SAF 路径 Dart 侧写不了）
+  bool get _canPickSaveDir => !Platform.isAndroid && !Platform.isIOS;
+
   /// 跳系统设置页授权，返回后重新解析保存位置
   Future<void> _openStorageSettings() async {
     await openAppSettings();
+    await _refreshSaveLocation();
+  }
+
+  /// 重新解析保存位置并热更新接收端（无需重启应用）
+  Future<void> _refreshSaveLocation() async {
     final loc = await resolveSaveLocation();
     if (!mounted) return;
-    setState(() {
-      _saveDir = loc.path;
-      _publicStorage = loc.isPublic;
-      _storageNote = loc.note;
-    });
+    setState(() => _applyLocationToState(loc));
     _server?.saveDir = loc.path;
+  }
+
+  void _applyLocationToState(SaveLocation loc) {
+    _saveDir = loc.path;
+    _publicStorage = loc.isPublic;
+    _saveDirCustom = loc.isCustom;
+    _storageNote = loc.note;
+  }
+
+  /// 选择接收目录（桌面端）
+  Future<void> _pickSaveDir() async {
+    final picked = await pickSaveDirectory(initialDirectory: _saveDir);
+    if (picked == null || !mounted) return;
+    try {
+      await SaveDirPrefs.save(picked);
+    } catch (e) {
+      if (mounted) setState(() => _status = '保存目录设置失败: $e');
+      return;
+    }
+    await _refreshSaveLocation();
+    if (!mounted) return;
+    setState(() => _status = '接收保存到: $_saveDir');
+  }
+
+  /// 恢复平台默认接收目录
+  Future<void> _resetSaveDir() async {
+    await SaveDirPrefs.clear();
+    await _refreshSaveLocation();
+    if (!mounted) return;
+    setState(() => _status = '已恢复默认接收目录: $_saveDir');
   }
 
   Widget _buildTransferPanel() {
